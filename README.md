@@ -1,5 +1,3 @@
-# Dissertation_spectinga
-
 # Hierarchical Bayesian Hedonic Pricing of Used Tractors
 
 This project develops a probabilistic pricing model for **used agricultural tractors**, using a large multi-country dataset provided by **Spectinga**.
