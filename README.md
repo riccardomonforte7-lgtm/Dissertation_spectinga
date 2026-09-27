@@ -17,7 +17,7 @@ A secondary analysis also investigates whether advertised **asking prices** can 
 
 The project uses proprietary data provided by **Spectinga**. The original dataset contains agricultural machinery listings and transaction records from multiple countries, together with technical specifications and market information.
 
-See the [Data](#data) section for further details.
+See the [`data/README.md`](./data/README.md) file for further details.
 
 ## Methodology
 
