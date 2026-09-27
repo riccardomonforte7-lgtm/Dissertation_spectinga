@@ -17,7 +17,7 @@ A secondary analysis also investigates whether advertised **asking prices** can 
 
 The project uses proprietary data provided by **Spectinga**. The original dataset contains agricultural machinery listings and transaction records from multiple countries, together with technical specifications and market information.
 
-See the [`data/README.md`](./data/README.md) file for further details.
+See the [`Data/README.md`](./Data/README.md) file for further details.
 
 ## Methodology
 
@@ -49,4 +49,4 @@ The results also show that:
 
 The final model explains approximately **93% of the in-sample variation in log prices**, while retaining meaningful predictive performance on a chronological test set.
 
-For a complete overview of the project, see [Report](#Report) section.
+For a complete overview of the project, see [`Report/s2882823_last_version.pdf`](./Report/s2882823_last_version.pdf).
