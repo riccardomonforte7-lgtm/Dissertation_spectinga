@@ -1,0 +1,5029 @@
+```{r} 
+##Import data
+#upload relevant packages
+# install.packages(c("readxl", "dplyr", "janitor", "readr", "ggplot2","corrplot")) #install packages if needed
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(janitor)
+library(INLA)
+library(readr)
+library(stringr)
+library(tidyr)
+
+#EDA and data pre-processing
+#Let's start by defining the variables to keep
+variables_to_keep <- c(
+  "market_id",
+  "channel",
+  "price_type",
+  "source",
+  "country",
+  "make",
+  "model_series",
+  "equipment_type",
+  "year",
+  "hours",
+  "horsepower",
+  "price",
+  "currency",
+  "vat_basis",
+  "price_excl_vat",
+  "observed_date",
+  "transmission",
+  "gps",
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "cab_suspension",
+  "air_conditioning",
+  "isobus"
+)
+
+file_path <- file.path("Data", "market_listings.csv")
+
+id_vars <- c("market_id")
+integer_vars <- c("year")
+numeric_vars <- c("hours", "horsepower", "price", "price_excl_vat")
+high_card_categorical_vars <- c("source", "country", "make", "model_series","currency","transmission", "gps")
+binary_vars <- c("front_pto", "front_loader", "front_linkage", "front_axle_suspension", "cab_suspension", "air_conditioning", "isobus")
+low_card_categorical_vars <- c("channel", "price_type", "equipment_type", "vat_basis")
+date_vars <- c("observed_date")
+
+column_types <- c(
+  setNames(
+    rep(list(col_character()), length(id_vars)),
+    id_vars
+  ),
+
+  setNames(
+    rep(list(col_integer()), length(integer_vars)),
+    integer_vars
+  ),
+
+  setNames(
+    rep(list(col_double()), length(numeric_vars)),
+    numeric_vars
+  ),
+
+  setNames(
+    rep(list(col_character()), length(high_card_categorical_vars)),
+    high_card_categorical_vars
+  ),
+
+  setNames(
+    rep(list(col_character()), length(binary_vars)),
+    binary_vars
+  ),
+
+  setNames(
+    rep(list(col_character()), length(low_card_categorical_vars)),
+    low_card_categorical_vars
+  ),
+
+ setNames(
+    rep(
+      list(col_date(format = "%d/%m/%Y")),
+      length(date_vars)
+    ),
+    date_vars
+  )
+)
+
+market_col_types <- do.call(
+  cols_only,
+  column_types
+)
+
+market_data_raw <- read_csv(
+  file = file_path,
+  col_types = market_col_types,
+  na = c("", "NA", "N/A", "NULL"),
+  trim_ws = TRUE,
+  show_col_types = FALSE
+)
+```
+
+```{r} 
+##Data Cleaning
+head(market_data_raw)
+ncol(market_data_raw)
+dim(market_data_raw)
+names(market_data_raw)
+glimpse(market_data_raw)
+problems(market_data_raw)
+
+market_data <- market_data_raw
+
+#Define categorical variables
+categorical_vars <- c(
+  high_card_categorical_vars,
+  low_card_categorical_vars,
+  binary_vars
+)
+
+#Delete extra space at the start and end of the string, reduces more consecutive spaces into one space, transform empty strings into NA
+
+# Clean categorical variables
+for (var in categorical_vars) {
+  market_data[[var]] <- trimws(gsub("\\s+", " ", as.character(market_data[[var]]), perl = TRUE))
+  market_data[[var]][market_data[[var]] == ""] <- NA
+}
+
+# Count unique values and calculate percentages
+value_count <- function(data, variable) {
+  x <- data[[variable]]
+  counts <- table(x, useNA = "ifany")
+  counts <- sort(counts, decreasing = TRUE)
+
+  data.frame(
+    value = names(counts),
+    n = as.integer(counts),
+    percentage = round(100 * as.integer(counts) / sum(counts), 3),
+    row.names = NULL
+  )
+}
+
+categorical_value_tables <- setNames(
+  lapply(categorical_vars, function(x) value_count(market_data, x)),
+  categorical_vars
+)
+
+categorical_value_tables
+
+
+#Categorical variables
+categorical_value_tables$channel #ok
+categorical_value_tables$price_type #ok
+categorical_value_tables$equipment_type #ok
+categorical_value_tables$vat_basis #transform "unknown" in NA
+
+categorical_value_tables$source #ok 23 categories
+categorical_value_tables$country #ok will strip out NA
+print(n=900, categorical_value_tables$make) #manipulation necessary
+print(n = 500, categorical_value_tables$model_series) #manipulation necessary
+categorical_value_tables$currency #only useful to apply conversion rate to price column
+print(n = Inf, categorical_value_tables$transmission) #manipulation necessary
+categorical_value_tables$gps #manipulation necessary
+
+#Binary variables
+categorical_value_tables$front_pto
+categorical_value_tables$front_loader
+categorical_value_tables$front_linkage
+categorical_value_tables$front_axle_suspension
+categorical_value_tables$cab_suspension
+categorical_value_tables$air_conditioning
+categorical_value_tables$isobus
+
+#create clean dataframe
+market_data_clean <- market_data
+```
+
+
+dim(market_data_clean)
+
+#Data Manipulation
+```{r}
+# Replace "unknown" in vat_basis with NA
+market_data_clean$vat_basis[
+  market_data_clean$vat_basis == "unknown"
+] <- NA
+
+# Keep the original make variable
+market_data_clean$make_original <- market_data_clean$make
+
+
+# Main make mappings
+make_mapping <- data.frame(
+  make_original = c(
+    "CLAAS",
+    "kramer",
+    "DIECI",
+    "LIEBHERR",
+    "VOLVO",
+    "AVANT",
+    "AGRAM",
+
+    "Deutz Fahr",
+    "Case-IH",
+    "Can-am",
+    "Mercedes",
+    "Mercedes Benz",
+    "MERCEDES-BENZ",
+    "UNICARRIERS",
+
+    "CAT",
+
+    "Carerpillar",
+    "John Derre",
+    "Komatzu",
+    "Kumatsu",
+    "Hitach",
+    "Trelleboarg",
+    "Trellebourg TM 1060",
+    "Trelleboarg BKT",
+
+    "Agco",
+    "Tafe",
+    "Same",
+    "Giant",
+    "HAUER",
+    "Ceat",
+    "QUIVOGNE",
+
+    "Hurlimann",
+
+    "Kramer-allrad",
+    "Ingersoll Rand",
+
+    "Schaffer",
+    "Schafer",
+    "SCHAEFER"
+  ),
+
+  make_clean = c(
+    "Claas",
+    "Kramer",
+    "Dieci",
+    "Liebherr",
+    "Volvo",
+    "Avant",
+    "Agram",
+
+    "Deutz-Fahr",
+    "Case IH",
+    "Can-Am",
+    "Mercedes-Benz",
+    "Mercedes-Benz",
+    "Mercedes-Benz",
+    "UniCarriers",
+
+    "Caterpillar",
+
+    "Caterpillar",
+    "John Deere",
+    "Komatsu",
+    "Komatsu",
+    "Hitachi",
+    "Trelleborg",
+    "Trelleborg",
+    "Trelleborg",
+
+    "AGCO",
+    "TAFE",
+    "SAME",
+    "GiANT",
+    "Hauer",
+    "CEAT",
+    "Quivogne",
+
+    "Hürlimann",
+
+    "Kramer",
+    "Ingersoll-Rand",
+
+    "Schäffer",
+    "Schäffer",
+    "Schäffer"
+  ),
+
+  stringsAsFactors = FALSE
+)
+
+
+# Makes containing model information
+make_model_mapping <- data.frame(
+  make_original = c(
+    "Ford 5000",
+    "Ford 5000 /",
+    "Ford 4830 4WD",
+
+    "Fiat 80-90 DT",
+    "Fiat 85-90",
+    "Fiat 85-90 /",
+    "Fiat 880 DT",
+    "Fiat 880 DT 5",
+    "Fiat 880 DT/5",
+    "Fiat 880 DT/5 /",
+
+    "Volvo L35G",
+    "VOLVO L35G",
+    "Volvo L70 SN",
+    "Volvo L70 C",
+    "Volvo BM 400",
+    "Volvo BM 430",
+    "Volvo BM 650",
+    "Volvo BM 5801",
+
+    "International 674",
+    "International 844 AXL",
+    "International 955 AXL",
+    "International 955 AXL /",
+
+    "Branson 5025C",
+    "Kubota 5030",
+    "Zetor 5245",
+    "Zetor 5245 /",
+
+    "Trelleborg TM 1060",
+    "Trelleborg TM 900",
+    "Trelleborg TM1060",
+    "Ahlmann Al85t shovel (bj2001)",
+
+    "CLAAS FL",
+    "CLAAS FL 120",
+
+    "FENDT CARGO 4X/75 DW",
+    "FENDT CARGO 4X75 COMPACT",
+    "Fendt Cargo 4x75 Compact",
+
+    "Fiat 880 DT 5 /",
+
+    "Goodyear DT 830",
+
+    "Liebherr Winch  4200kg",
+
+    "Ljungby Maskin",
+
+    "Michelin Mach X Bib",
+    "Michelin MachXBiB",
+
+    "Mitas AC65",
+    "Mitas AC70T",
+    "Mitas Festfelge 1830/1920mm(Spur)",
+
+    "BKT Agrimax",
+
+    "STOLL FS10 7099264",
+    "Stoll 35-18",
+
+    "Zetor 5245  /",
+
+    "beco JIP voor aan de shovel",
+    "nette schaffer 442 shovel met pelikaan bak"
+  ),
+
+  make_clean = c(
+    "Ford",
+    "Ford",
+    "Ford",
+
+    "Fiat",
+    "Fiat",
+    "Fiat",
+    "Fiat",
+    "Fiat",
+    "Fiat",
+    "Fiat",
+
+    "Volvo",
+    "Volvo",
+    "Volvo",
+    "Volvo",
+    "Volvo BM",
+    "Volvo BM",
+    "Volvo BM",
+    "Volvo BM",
+
+    "International",
+    "International",
+    "International",
+    "International",
+
+    "Branson",
+    "Kubota",
+    "Zetor",
+    "Zetor",
+
+    "Trelleborg",
+    "Trelleborg",
+    "Trelleborg",
+    "Ahlmann",
+
+    "Claas",
+    "Claas",
+
+    "Fendt",
+    "Fendt",
+    "Fendt",
+
+    "Fiat",
+
+    "Goodyear",
+
+    "Liebherr",
+
+    "Ljungby",
+
+    "Michelin",
+    "Michelin",
+
+    "Mitas",
+    "Mitas",
+    "Mitas",
+
+    "BKT",
+
+    "Stoll",
+    "Stoll",
+
+    "Zetor",
+
+    "Beco",
+    "Schäffer"
+  ),
+
+  stringsAsFactors = FALSE
+)
+
+
+# Advertisement text and product descriptions
+description_make_mapping <- data.frame(
+  make_original = c(
+    "INKOMMANDE TRAKTOR - CASE 1690+L",
+    "INKOMMANDE TRAKTOR - NEW HOLLAND TD80D",
+    "INKOMMANDE TRAKTOR JOHN DEERE 1640",
+    "INKOMMANDE Massey Ferguson 4335-4",
+
+    "NU SÄNKT PRIS- Fiat 80-90 DT",
+    "SÄNKT PRIS - Case IH",
+    "SÄNKT PRIS! New Holland",
+
+    "[8410] Steyr",
+    "Ładowarka Doosan",
+    "Ładowarka kołowa Caterpillar",
+    "Ładowarka kołowa Liebherr",
+    "CARGADORA CATERPILLAR",
+    "PALA CARGADORA RUEDAS CATERPILLAR"
+  ),
+
+  make_clean = c(
+    "Case",
+    "New Holland",
+    "John Deere",
+    "Massey Ferguson",
+
+    "Fiat",
+    "Case IH",
+    "New Holland",
+
+    "Steyr",
+    "Doosan",
+    "Caterpillar",
+    "Liebherr",
+    "Caterpillar",
+    "Caterpillar"
+  ),
+
+  stringsAsFactors = FALSE
+)
+
+
+# Combine the three mapping tables
+make_mapping <- rbind(
+  make_mapping,
+  make_model_mapping,
+  description_make_mapping
+)
+
+
+# Check for duplicated original values
+mapping_counts <- table(make_mapping$make_original)
+duplicated_make_mappings <- data.frame(
+  make_original = names(mapping_counts)[mapping_counts > 1],
+  n = as.integer(mapping_counts[mapping_counts > 1]),
+  row.names = NULL
+)
+
+duplicated_make_mappings
+
+
+# Apply exact make mappings
+mapping_index <- match(
+  market_data_clean$make_original,
+  make_mapping$make_original
+)
+
+market_data_clean$make <- make_mapping$make_clean[mapping_index]
+
+no_mapping <- is.na(mapping_index)
+market_data_clean$make[no_mapping] <- market_data_clean$make_original[no_mapping]
+
+
+# Values that do not represent valid manufacturer names
+invalid_make_values <- c(
+  "Sonstige",
+  "Andere",
+  "Divers",
+  "Søg",
+
+  "INKOMMANDE TRAKTOR",
+  "INKOMMANDE TRAKTOR -",
+  "NU SÄNKT PRIS -",
+  "NU SÄNKT PRIS-",
+  "SÄNKT PRIS -",
+  "SÄNKT PRIS!",
+  "SPARA 10000 KRONOR!",
+  "SPARA 20000KR -",
+  "PAKETPRIS!",
+  "PAKETERBJUDANDE!",
+  "Günstig",
+
+  "Forklift",
+  "Accessoire",
+  "Container",
+  "Continer",
+  "Autotransporter",
+  "Semi-Dieplader",
+  "Minitractor",
+  "TELESCOPICA",
+
+  "CULTIVATEUR",
+  "Faucheuse",
+  "Fraise",
+  "GYROBROYEUR",
+  "Pulverisation",
+  "Pulvérisateur",
+  "TONDEUSE",
+  "tondeuse",
+  "enfouisseur",
+  "ENFOUISSEUR",
+  "Mixeur",
+
+  "Ciągnik rolniczy",
+  "Ładowarka Kołowa",
+  "Pyöräkuormaajat",
+
+  "Fabrication",
+  "Exploitation",
+  "Projet",
+  "vend",
+  "creat",
+  "2",
+  "3-punkt Gafflar",
+  "543 M #1CC543MCJPX235339",
+  "ADAPTATION",
+  "CALIBREUSE",
+  "CARGO 4X/75",
+  "CARGO 4X75",
+  "Cargo",
+  "Chieftain dieplader 19ton (bj2010) met landbouw ke",
+  "DT 75",
+  "Fäste på",
+  "Haakarm",
+  "Knikarmhoogwerker",
+  "L20 L25",
+  "Maakauha",
+  "Masthoogwerker",
+  "Pallgafflar",
+  "Réfractomètre",
+  "Sopvals m vattentank",
+  "Storsäcklyft",
+  "Utförsäljning Fatlyft",
+  "poulailler",
+  "SPARA 20000 KR -"
+)
+
+
+# Invalid makes are set to NA
+market_data_clean$make[
+  market_data_clean$make %in% invalid_make_values
+] <- NA
+
+# Keep the detailed cleaned make before grouping rare categories
+market_data_clean$make_detailed <- market_data_clean$make
+
+
+# Minimum share required to keep a make as a separate category
+make_share_threshold <- 0.0003
+
+# Identify rare makes
+make_counts <- table(
+  market_data_clean$make,
+  useNA = "no"
+)
+
+make_shares <- as.numeric(make_counts) / nrow(market_data_clean)
+
+rare_makes <- names(make_counts)[
+  make_shares < make_share_threshold
+]
+
+
+# Group rare makes as "Other"
+market_data_clean$make[
+  !is.na(market_data_clean$make) &
+  market_data_clean$make %in% rare_makes
+] <- "Other"
+
+
+# Inspect cleaned make values
+make_counts <- table(
+  market_data_clean$make,
+  useNA = "ifany"
+)
+
+make_counts <- sort(make_counts, decreasing = TRUE)
+
+make_values_clean <- data.frame(
+  make = names(make_counts),
+  n = as.integer(make_counts),
+  percentage = round(
+    100 * as.integer(make_counts) / sum(make_counts),
+    3
+  ),
+  row.names = NULL
+)
+
+print(make_values_clean, row.names = FALSE)
+```
+
+```{r} 
+# Standardise model-series values and remove manufacturer names
+
+# Keep original value for auditing
+market_data_clean$model_series_original <- market_data_clean$model_series
+
+# Clean model-series text
+market_data_clean$model_series_clean <- tolower(as.character(market_data_clean$model_series))
+market_data_clean$model_series_clean <- trimws(gsub("[[:space:]]+", " ", market_data_clean$model_series_clean))
+
+# Create compact model-series key
+market_data_clean$model_series_key <- gsub(
+  "[^[:alnum:]]+", "",
+  market_data_clean$model_series_clean
+)
+market_data_clean$model_series_key[market_data_clean$model_series_key == ""] <- NA
+
+# Create compact manufacturer key
+market_data_clean$make_removal_key <- tolower(as.character(market_data_clean$make_detailed))
+market_data_clean$make_removal_key <- gsub(
+  "[^[:alnum:]]+", "",
+  market_data_clean$make_removal_key
+)
+market_data_clean$make_removal_key[market_data_clean$make_removal_key == ""] <- NA
+
+# Remove manufacturer name from each model-series key
+idx <- !is.na(market_data_clean$model_series_key) &
+       !is.na(market_data_clean$make_removal_key)
+
+market_data_clean$model_series_key[idx] <- mapply(
+  function(model, make) gsub(make, "", model, fixed = TRUE),
+  market_data_clean$model_series_key[idx],
+  market_data_clean$make_removal_key[idx],
+  USE.NAMES = FALSE
+)
+
+# Convert empty keys to NA
+market_data_clean$model_series_key[
+  market_data_clean$model_series_key == ""
+] <- NA
+
+# Remove temporary manufacturer key
+market_data_clean$make_removal_key <- NULL
+
+
+# Inspect cleaned model-series keys and frequencies
+model_counts <- table(
+  market_data_clean$model_series_key,
+  useNA = "ifany"
+)
+
+model_counts <- sort(model_counts, decreasing = TRUE)
+
+model_series_values_clean <- data.frame(
+  model_series_key = names(model_counts),
+  n = as.integer(model_counts),
+  percentage = round(100 * as.integer(model_counts) / sum(model_counts), 3),
+  row.names = NULL
+)
+
+print(head(model_series_values_clean, 200), row.names = FALSE)
+
+# Clean and standardise the transmission variable by grouping
+# manufacturer-specific names, multilingual descriptions and formatting
+# variants into a smaller set of technologically meaningful categories.
+# Missing transmission information is retained as a separate
+# "Not reported" category to avoid discarding a large share of the sample.
+```
+
+```{r} 
+# Clean and standardise the transmission variable by grouping
+# manufacturer-specific names, multilingual descriptions and formatting
+# variants into a smaller set of technologically meaningful categories.
+# Missing transmission information is retained as a separate
+# "Not reported" category to avoid discarding a large share of the sample.
+
+
+# Define patterns associated with continuously variable
+# or stepless transmission systems
+cvt_pattern <- paste(
+  c(
+    "\\bcvt\\b",
+    "\\bivt\\b",
+    "\\bcvx\\b",
+    "\\bcvxdrive\\b",
+    "\\bvario\\b",
+    "\\bcmatic\\b",
+    "\\bttv\\b",
+    "\\bauto\\s*powr\\b",
+    "\\bauto\\s*power\\b",
+    "\\bauto\\s*command\\b",
+    "\\bdyna\\s*vt\\b",
+    "\\bcontinuously\\s+variable\\b",
+    "\\bcontinuous\\s+variable\\b",
+    "\\bvariation\\s+continue\\b",
+    "\\bvariazione\\s+continua\\b",
+    "\\bstufenlos\\w*\\b",
+    "\\bstepless\\b",
+    "\\bportaaton\\b",
+    "\\bsteglos\\b",
+    "\\btrinn?los\\b",
+    "\\bkvt\\b",
+    "\\bevt\\b",
+    "\\bvt\\s*drive\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns associated with full-powershift transmissions
+full_powershift_pattern <- paste(
+  c(
+    "\\bfull\\s*power\\s*shift\\b",
+    "\\bfullpowershift\\b",
+    "\\bpower\\s*command\\b",
+    "\\bultra\\s*command\\b",
+    "\\bpowerdrive\\b",
+    "\\be23\\b",
+    "\\bplanetary\\s+power\\s*shift\\b",
+    "\\bvolllastschalt\\w*\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns associated with semi-powershift transmissions
+semi_powershift_pattern <- paste(
+  c(
+    "\\bsemi\\s*power\\s*shift\\b",
+    "\\bdyna\\s*[467]\\b",
+    "\\bdynashift\\b",
+    "\\bhexashift\\b",
+    "\\bdynamic\\s*command\\b",
+    "\\belectro\\s*command\\b",
+    "\\bautoquad\\b",
+    "\\bpower\\s*quad\\b",
+    "\\bpowerquad\\b",
+    "\\bpowr\\s*quad\\b",
+    "\\bpowrquad\\b",
+    "\\bcommandquad\\b",
+    "\\brange\\s*command\\b",
+    "\\bdual\\s*command\\b",
+    "\\bactive\\s*drive\\b",
+    "\\bactivedrive\\b",
+    "\\bversu\\b",
+    "\\bhi\\s*tech\\b",
+    "\\bhitech\\b",
+    "\\bquadrishift\\b",
+    "\\btwinshift\\b",
+    "\\bpartial\\s+power\\s*shift\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns containing a generic powershift description
+# that cannot be assigned reliably to the full or semi-powershift groups
+powershift_pattern <- paste(
+  c(
+    "\\bpower\\s*shift\\b",
+    "\\bpowershift\\b",
+    "\\brc\\s*shift\\b",
+    "\\brcshift\\b",
+    "\\brv\\s*shift\\b",
+    "\\brvshift\\b",
+    "\\bspeedshift\\b",
+    "\\bxtrashift\\b",
+    "\\bxtra\\s*shift\\b",
+    "\\blastschalt\\w*\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns associated with shuttle and reverser systems
+shuttle_pattern <- paste(
+  c(
+    "\\bpower\\s*shuttle\\b",
+    "\\bpowershuttle\\b",
+    "\\bpower\\s*shuttel\\b",
+    "\\bsync\\s*shuttle\\b",
+    "\\bsync\\s*reverser\\b",
+    "\\bmechanical\\s*shuttle\\b",
+    "\\bpower\\s*reverser\\b",
+    "\\bpowr\\s*reverser\\b",
+    "\\bpowrreverser\\b",
+    "\\bwendeschaltung\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns associated with hydrostatic transmissions
+hydrostatic_pattern <- paste(
+  c(
+    "\\bhydro\\b",
+    "\\bhydrostatic\\w*\\b",
+    "\\bhydrostat\\w*\\b",
+    "\\bhidrostat\\w*\\b",
+    "\\bhst\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns associated with manual or mechanical transmissions
+manual_pattern <- paste(
+  c(
+    "\\bmanual\\w*\\b",
+    "\\bmanuel\\w*\\b",
+    "\\bmanuell\\w*\\b",
+    "\\bmecan\\w*\\b",
+    "\\bmechanic\\w*\\b",
+    "\\bmeccanica\\b",
+    "\\bsynchro\\w*\\b",
+    "\\bsyncro\\w*\\b",
+    "\\bsincron\\w*\\b",
+    "\\bschaltgetriebe\\b",
+    "\\bhandgeschakeld\\b",
+    "\\bgear\\s*drive\\b"
+  ),
+  collapse = "|"
+)
+
+
+# Define patterns identifying generic automatic transmissions
+# for which a more precise technological category is unavailable
+automatic_pattern <- paste(
+  c(
+    "^automatic$",
+    "^automatic\\s+transmission$",
+    "^automat$",
+    "^automata$",
+    "^automatique$",
+    "^automaat$",
+    "\\bfully\\s+automatic\\b"
+  ),
+  collapse = "|"
+)
+
+# Standardise transmission descriptions and group them into broad categories
+
+# Keep original transmission value
+market_data_clean$transmission_original <- market_data_clean$transmission
+
+# Clean transmission descriptions
+transmission_clean <- as.character(market_data_clean$transmission)
+transmission_clean <- gsub("<[^>]+>", "", transmission_clean)
+transmission_clean <- stringi::stri_trans_general(transmission_clean, "Latin-ASCII")
+transmission_clean <- tolower(transmission_clean)
+transmission_clean <- gsub("[^[:alnum:]]+", " ", transmission_clean)
+transmission_clean <- trimws(gsub("[[:space:]]+", " ", transmission_clean))
+
+market_data_clean$transmission_clean <- transmission_clean
+
+
+# Start with unclassified values
+transmission_grouped <- rep("Other / unclassified", nrow(market_data_clean))
+
+# Missing transmission information
+transmission_grouped[is.na(transmission_clean)] <- "Not reported"
+
+# Keep track of observations that have not yet been classified
+unassigned <- !is.na(transmission_clean)
+
+# Valtra "Direct" is interpreted as CVT
+valtra_direct <- unassigned &
+  !is.na(market_data_clean$make_detailed) &
+  tolower(market_data_clean$make_detailed) == "valtra" &
+  transmission_clean == "direct"
+
+transmission_grouped[valtra_direct] <- "CVT / stepless"
+unassigned[valtra_direct] <- FALSE
+
+
+# CVT / stepless
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(cvt_pattern)
+)
+
+transmission_grouped[idx] <- "CVT / stepless"
+unassigned[idx] <- FALSE
+
+
+# Full powershift
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(full_powershift_pattern)
+)
+
+transmission_grouped[idx] <- "Full powershift"
+unassigned[idx] <- FALSE
+
+
+# Semi-powershift
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(semi_powershift_pattern)
+)
+
+transmission_grouped[idx] <- "Semi-powershift"
+unassigned[idx] <- FALSE
+
+
+# Powershift unspecified
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(powershift_pattern)
+)
+
+transmission_grouped[idx] <- "Powershift unspecified"
+unassigned[idx] <- FALSE
+
+
+# Shuttle / reverser
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(shuttle_pattern)
+)
+
+transmission_grouped[idx] <- "Shuttle / reverser"
+unassigned[idx] <- FALSE
+
+
+# Hydrostatic
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(hydrostatic_pattern)
+)
+
+transmission_grouped[idx] <- "Hydrostatic"
+unassigned[idx] <- FALSE
+
+
+# Manual / mechanical
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(manual_pattern)
+)
+
+transmission_grouped[idx] <- "Manual / mechanical"
+unassigned[idx] <- FALSE
+
+
+# Automatic unspecified
+idx <- unassigned & stringr::str_detect(
+  transmission_clean,
+  stringr::regex(automatic_pattern)
+)
+
+transmission_grouped[idx] <- "Automatic unspecified"
+unassigned[idx] <- FALSE
+
+market_data_clean$transmission_grouped <- transmission_grouped
+
+
+# Inspect grouped transmission frequencies
+transmission_counts <- sort(
+  table(market_data_clean$transmission_grouped),
+  decreasing = TRUE
+)
+
+transmission_values_clean <- data.frame(
+  transmission_grouped = names(transmission_counts),
+  n = as.integer(transmission_counts),
+  percentage = round(100 * as.integer(transmission_counts) /
+                       sum(transmission_counts), 3),
+  row.names = NULL
+)
+
+print(transmission_values_clean, row.names = FALSE)
+
+
+# Inspect most frequent unclassified descriptions
+x <- market_data_clean$transmission_clean[
+  market_data_clean$transmission_grouped == "Other / unclassified"
+]
+
+unclassified_counts <- sort(table(x), decreasing = TRUE)
+
+unclassified_transmissions <- data.frame(
+  transmission_clean = names(unclassified_counts),
+  n = as.integer(unclassified_counts),
+  row.names = NULL
+)
+
+print(head(unclassified_transmissions, 100), row.names = FALSE)
+
+
+# Set transmission factor levels and reference category
+market_data_clean$transmission_grouped <- factor(
+  market_data_clean$transmission_grouped,
+  levels = c(
+    "Manual / mechanical",
+    "CVT / stepless",
+    "Full powershift",
+    "Semi-powershift",
+    "Powershift unspecified",
+    "Hydrostatic",
+    "Shuttle / reverser",
+    "Automatic unspecified",
+    "Other / unclassified",
+    "Not reported"
+  )
+)
+```
+
+```{r} 
+##GPS variable
+# Clean and standardise the GPS variable by combining equivalent
+# descriptions into a smaller set of substantively meaningful categories.
+# Missing values are retained as "Not reported" because the absence of
+# GPS information does not necessarily imply that GPS equipment is absent.
+
+market_data_clean <- market_data_clean %>%
+  mutate(
+    # Preserve the original GPS value for auditing and comparison
+    gps_original = gps,
+
+    # Standardise capitalisation and unnecessary whitespace
+    gps_clean = gps %>%
+      str_to_lower() %>%
+      str_squish(),
+
+    # Group equivalent GPS descriptions into common categories
+    gps_grouped = case_when(
+      # Retain missing GPS information as a separate category
+      is.na(gps_clean) ~ "Not reported",
+
+      # Combine RTK-related descriptions
+      gps_clean %in% c(
+        "rtk",
+        "rtk gps"
+      ) ~ "RTK",
+
+      # Retain automatic steering as a separate functional category
+      gps_clean == "auto steering" ~ "Auto steering",
+
+      # Combine descriptions indicating that a GPS receiver is installed
+      gps_clean %in% c(
+        "gps receiver",
+        "receiver"
+      ) ~ "GPS receiver",
+
+      # Combine descriptions indicating that the machine is GPS-ready
+      gps_clean %in% c(
+        "ready",
+        "gps ready"
+      ) ~ "GPS ready",
+
+      # Combine affirmative but technologically unspecified responses
+      gps_clean %in% c(
+        "yes",
+        "ja"
+      ) ~ "GPS present",
+
+      # Retain any unexpected descriptions for subsequent inspection
+      TRUE ~ "Other / unclassified"
+    )
+  )
+
+  # Inspect the distribution of the grouped GPS variable
+gps_values_clean <- market_data_clean %>%
+  count(
+    gps_grouped,
+    name = "n",
+    sort = TRUE
+  ) %>%
+  mutate(
+    percentage = round(
+      100 * n / sum(n),
+      3
+    )
+  )
+
+print(gps_values_clean, n = Inf)
+```
+
+```{r}
+# Convert reported equipment features to TRUE and missing values to FALSE
+for (var in binary_vars) {
+  market_data_clean[[var]] <- market_data_clean[[var]] == "TRUE"
+  market_data_clean[[var]][is.na(market_data_clean[[var]])] <- FALSE
+}
+```
+
+```{r}
+
+#------------------------------------------------------------
+# Create final modelling dataset
+#------------------------------------------------------------
+
+variables_model <- c(
+  "market_id", "price", "price_excl_vat", "vat_basis", "currency",
+  "observed_date", "channel", "price_type", "source", "country",
+  "equipment_type", "make", "model_series_key", "year", "hours",
+  "horsepower", "transmission_grouped", "gps_grouped", "front_pto",
+  "front_loader", "front_linkage", "front_axle_suspension",
+  "cab_suspension", "air_conditioning", "isobus"
+)
+
+market_data_model <- market_data_clean[, variables_model]
+
+names(market_data_model)[names(market_data_model) == "model_series_key"] <- "model_series"
+names(market_data_model)[names(market_data_model) == "transmission_grouped"] <- "transmission"
+names(market_data_model)[names(market_data_model) == "gps_grouped"] <- "gps"
+
+names(market_data_model)
+```
+
+```{r}
+#------------------------------------------------------------
+# Frequency tables for final variables
+#------------------------------------------------------------
+
+value_count <- function(x) {
+
+  if (is.factor(x)) {
+    values <- factor(levels(x), levels = levels(x))
+    n <- tabulate(as.integer(x), nbins = length(levels(x)))
+
+    if (anyNA(x)) {
+      values <- c(values, factor(NA, levels = levels(x)))
+      n <- c(n, sum(is.na(x)))
+    }
+
+  } else {
+    values <- unique(x)
+
+    n <- vapply(seq_along(values), function(i) {
+      if (is.na(values[i])) {
+        sum(is.na(x))
+      } else {
+        sum(x == values[i], na.rm = TRUE)
+      }
+    }, integer(1))
+  }
+
+  order_n <- order(n, decreasing = TRUE)
+
+  data.frame(
+    value = values[order_n],
+    n = n[order_n],
+    percentage = round(100 * n[order_n] / sum(n), 3),
+    row.names = NULL
+  )
+}
+
+market_data_model_value_tables <- setNames(
+  lapply(market_data_model, value_count),
+  names(market_data_model)
+)
+
+market_data_model_value_tables
+```
+
+```{r}
+#------------------------------------------------------------
+# Define variable types
+#------------------------------------------------------------
+
+factor_vars_model <- c(
+  "channel",
+  "price_type",
+  "source",
+  "country",
+  "equipment_type",
+  "make",
+  "vat_basis"
+)
+
+numeric_vars_model <- c(
+  "price",
+  "price_excl_vat",
+  "hours",
+  "horsepower"
+)
+
+binary_vars_model <- c(
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "cab_suspension",
+  "air_conditioning",
+  "isobus"
+)
+
+
+#------------------------------------------------------------
+# Convert variables to final data types
+
+
+market_data_model$market_id <- as.character(market_data_model$market_id)
+market_data_model$currency <- as.character(market_data_model$currency)
+market_data_model$model_series <- as.character(market_data_model$model_series)
+market_data_model$observed_date <- as.Date(market_data_model$observed_date)
+
+market_data_model[factor_vars_model] <- lapply(
+  market_data_model[factor_vars_model],
+  factor
+)
+
+market_data_model[numeric_vars_model] <- lapply(
+  market_data_model[numeric_vars_model],
+  as.numeric
+)
+
+market_data_model$year <- as.integer(market_data_model$year)
+
+market_data_model[binary_vars_model] <- lapply(
+  market_data_model[binary_vars_model],
+  as.logical
+)
+
+
+#------------------------------------------------------------
+# Set transmission and GPS factor levels
+#------------------------------------------------------------
+
+market_data_model$transmission <- factor(
+  market_data_model$transmission,
+  levels = c(
+    "Manual / mechanical",
+    "CVT / stepless",
+    "Full powershift",
+    "Semi-powershift",
+    "Powershift unspecified",
+    "Hydrostatic",
+    "Shuttle / reverser",
+    "Automatic unspecified",
+    "Other / unclassified",
+    "Not reported"
+  )
+)
+
+market_data_model$gps <- factor(
+  market_data_model$gps,
+  levels = c(
+    "Not reported",
+    "GPS present",
+    "GPS ready",
+    "GPS receiver",
+    "Auto steering",
+    "RTK"
+  )
+)
+
+
+#------------------------------------------------------------
+# Create model-series index for INLA
+#------------------------------------------------------------
+
+market_data_model$model_series_id <- as.integer(
+  factor(market_data_model$model_series)
+)
+
+
+#------------------------------------------------------------
+# Check variable types and missing values
+#------------------------------------------------------------
+
+variable_types <- data.frame(
+  variable = names(market_data_model),
+  class = sapply(
+    market_data_model,
+    function(x) paste(class(x), collapse = ", ")
+  ),
+  missing_values = sapply(
+    market_data_model,
+    function(x) sum(is.na(x))
+  ),
+  unique_values = sapply(
+    market_data_model,
+    function(x) length(unique(x[!is.na(x)]))
+  ),
+  row.names = NULL
+)
+
+print(variable_types, row.names = FALSE)
+
+
+#------------------------------------------------------------
+# Check binary variables
+#------------------------------------------------------------
+
+sapply(
+  market_data_model[binary_vars_model],
+  class
+)
+
+
+#------------------------------------------------------------
+# Inspect final modelling dataset
+#------------------------------------------------------------
+
+dplyr::glimpse(market_data_model)
+```
+
+```{r}
+
+## Define age variable to be used in the model
+
+# Calculate machine age
+market_data_model$age <- as.integer(
+  format(market_data_model$observed_date, "%Y")
+) - market_data_model$year
+```
+
+```{r}
+# Inspect the distribution of machine age
+summary(market_data_model$age)
+
+# Check for implausible negative ages
+negative_ages <- market_data_model[
+  !is.na(market_data_model$age) & market_data_model$age < 0,
+  c("market_id", "observed_date", "year", "age")
+]
+
+negative_ages[order(negative_ages$age), ]
+
+# Replace negative ages with missing values
+market_data_model$age[
+  !is.na(market_data_model$age) & market_data_model$age < 0
+] <- NA_integer_
+
+summary(market_data_model$age)
+```
+
+```{r}
+# Create separate sold-price and asking-price variables
+
+market_data_model$price_sold <- NA_real_
+sold_rows <- !is.na(market_data_model$price_type) &
+  market_data_model$price_type == "sold"
+
+market_data_model$price_sold[sold_rows] <- market_data_model$price[sold_rows]
+
+
+market_data_model$price_ask <- NA_real_
+
+asking_net <- !is.na(market_data_model$price_type) &
+  market_data_model$price_type == "asking" &
+  !is.na(market_data_model$vat_basis) &
+  market_data_model$vat_basis == "net"
+
+asking_gross <- !is.na(market_data_model$price_type) &
+  market_data_model$price_type == "asking" &
+  !is.na(market_data_model$vat_basis) &
+  market_data_model$vat_basis == "gross"
+
+market_data_model$price_ask[asking_net] <- market_data_model$price[asking_net]
+market_data_model$price_ask[asking_gross] <- market_data_model$price_excl_vat[asking_gross]
+```
+
+```{r}
+# Inspect the modelling dataset
+str(market_data_model)
+```
+
+```{r}
+## Convert prices to EUR using previously downloaded daily ECB exchange rates
+
+# File containing the daily exchange rates
+exchange_rate_file <- file.path("Data", "ecb_exchange_rates_daily.csv")
+
+# Import exchange rates
+ecb_rates_daily <- read.csv(
+  exchange_rate_file,
+  stringsAsFactors = FALSE
+)
+
+# Ensure dates are stored correctly
+ecb_rates_daily$exchange_rate_date <- as.Date(ecb_rates_daily$exchange_rate_date)
+market_data_model$observed_date <- as.Date(market_data_model$observed_date)
+
+# Ensure currencies are stored as character
+ecb_rates_daily$currency <- as.character(ecb_rates_daily$currency)
+market_data_model$currency <- as.character(market_data_model$currency)
+
+# Create currency-date keys
+ecb_rates_daily$rate_key <- paste(
+  ecb_rates_daily$currency,
+  ecb_rates_daily$exchange_rate_date,
+  sep = "_"
+)
+
+market_data_model$rate_key <- paste(
+  market_data_model$currency,
+  market_data_model$observed_date,
+  sep = "_"
+)
+
+# Match each observation to its daily exchange rate
+rate_position <- match(
+  market_data_model$rate_key,
+  ecb_rates_daily$rate_key
+)
+
+market_data_model$currency_per_eur <-
+  ecb_rates_daily$currency_per_eur[rate_position]
+
+# Convert prices to EUR
+market_data_model$price_sold_eur <-
+  market_data_model$price_sold / market_data_model$currency_per_eur
+
+market_data_model$price_ask_eur <-
+  market_data_model$price_ask / market_data_model$currency_per_eur
+
+# Remove temporary keys
+market_data_model$rate_key <- NULL
+ecb_rates_daily$rate_key <- NULL
+```
+
+```{r}
+# Recode clearly implausible quantitative values as missing
+
+bad_hours <- !is.na(market_data_model$hours) &
+  (market_data_model$hours < 0 | market_data_model$hours >= 100000)
+
+bad_horsepower <- !is.na(market_data_model$horsepower) &
+  (market_data_model$horsepower <= 0 | market_data_model$horsepower > 2500)
+
+bad_age <- !is.na(market_data_model$age) &
+  (market_data_model$age < 0 | market_data_model$age > 120)
+
+market_data_model$hours[bad_hours] <- NA_real_
+market_data_model$horsepower[bad_horsepower] <- NA_real_
+market_data_model$age[bad_age] <- NA_integer_
+```
+
+```{r}
+# Creation of two separate databases
+
+# Predictors retained in both modelling datasets
+model_predictors <- c(
+  "market_id",
+  "observed_date",
+  "channel",
+  "source",
+  "country",
+  "equipment_type",
+  "make",
+  "model_series",
+  "model_series_id",
+  "age",
+  "hours",
+  "horsepower",
+  "transmission",
+  "gps",
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "cab_suspension",
+  "air_conditioning",
+  "isobus"
+)
+
+
+# Dataset containing valid realised sale prices
+sold_rows <- !is.na(market_data_model$price_type) &
+  market_data_model$price_type == "sold" &
+  !is.na(market_data_model$equipment_type) &
+  market_data_model$equipment_type == "tractor" &
+  !is.na(market_data_model$price_sold_eur) &
+  is.finite(market_data_model$price_sold_eur) &
+  market_data_model$price_sold_eur > 0
+
+market_data_sold <- market_data_model[
+  sold_rows,
+  c("price_sold_eur", model_predictors)
+]
+
+names(market_data_sold)[1] <- "price_sold"
+market_data_sold <- droplevels(market_data_sold)
+
+
+# Dataset containing valid net asking prices
+ask_rows <- !is.na(market_data_model$price_type) &
+  market_data_model$price_type == "asking" &
+  !is.na(market_data_model$equipment_type) &
+  market_data_model$equipment_type == "tractor" &
+  !is.na(market_data_model$price_ask_eur) &
+  is.finite(market_data_model$price_ask_eur) &
+  market_data_model$price_ask_eur > 0
+
+market_data_ask <- market_data_model[
+  ask_rows,
+  c("price_ask_eur", model_predictors)
+]
+
+names(market_data_ask)[1] <- "price_ask"
+market_data_ask <- droplevels(market_data_ask)
+```
+
+```{r}
+#------------------------------------------------------------
+# Create final complete-case datasets
+#------------------------------------------------------------
+
+# Final sold-price dataset
+market_data_sold_final <- market_data_sold %>%
+  filter(
+    if_all(
+      everything(),
+      ~ !is.na(.x)
+    ),
+    is.finite(price_sold),
+    price_sold > 0
+  ) %>%
+  droplevels() %>%
+  mutate(
+    model_series_id = as.integer(
+      factor(model_series)
+    ),
+
+    make_id = as.integer(
+      factor(make)
+    ),
+
+    country_id = as.integer(
+      factor(country)
+    )
+  )
+
+
+# Final asking-price dataset
+market_data_ask_final <- market_data_ask %>%
+  filter(
+    if_all(
+      everything(),
+      ~ !is.na(.x)
+    ),
+    is.finite(price_ask),
+    price_ask > 0
+  ) %>%
+  droplevels() %>%
+  mutate(
+    model_series_id = as.integer(
+      factor(model_series)
+    ),
+
+    make_id = as.integer(
+      factor(make)
+    ),
+
+    country_id = as.integer(
+      factor(country)
+    )
+  )
+
+
+# Check dimensions
+dim(market_data_sold_final)
+dim(market_data_ask_final)
+
+# Check variable names
+names(market_data_sold_final)
+names(market_data_ask_final)
+```
+names(market_data_sold_final)
+
+```{r}
+# Summarise the temporal coverage of an analytical dataset
+temporal_coverage_summary <- function(data, dataset_name) {
+
+  dates <- data$observed_date
+
+  data.frame(
+    dataset = dataset_name,
+    observations = nrow(data),
+    first_date = min(dates),
+    last_date = max(dates),
+    period_days = as.integer(
+      max(dates) - min(dates)
+    ),
+    distinct_days = length(
+      unique(dates)
+    ),
+    distinct_months = length(
+      unique(
+        format(dates, "%Y-%m")
+      )
+    ),
+    distinct_years = length(
+      unique(
+        format(dates, "%Y")
+      )
+    )
+  )
+}
+
+# Calculate temporal coverage for sold and asking prices
+temporal_coverage <- rbind(
+  temporal_coverage_summary(
+    market_data_sold_final,
+    "Sold-price dataset"
+  ),
+  temporal_coverage_summary(
+    market_data_ask_final,
+    "Asking-price dataset"
+  )
+)
+
+temporal_coverage
+```
+
+```{r}
+# Split an analytical dataset chronologically
+# while keeping all observations from the same date together
+temporal_train_test_split <- function(
+    data,
+    test_fraction = 0.20
+) {
+
+  # Check that the date variable is correctly formatted
+  if (!inherits(data$observed_date, "Date")) {
+    stop("observed_date must be stored as a Date variable.")
+  }
+
+  # Order observations chronologically
+  data <- data[
+    order(
+      data$observed_date,
+      data$market_id
+    ),
+  ]
+
+  rownames(data) <- NULL
+
+  # Count observations for each date
+  daily_counts <- table(
+    data$observed_date
+  )
+
+  dates <- as.Date(
+    names(daily_counts)
+  )
+
+  daily_counts <- as.integer(
+    daily_counts
+  )
+
+  # Calculate the number of observations from
+  # each candidate cutoff date to the final date
+  observations_from_date <- rev(
+    cumsum(
+      rev(daily_counts)
+    )
+  )
+
+  # Define the target number of test observations
+  target_test_observations <- nrow(data) *
+    test_fraction
+
+  # Select the cutoff date giving the closest
+  # possible test proportion without splitting dates
+  cutoff_position <- which.min(
+    abs(
+      observations_from_date -
+        target_test_observations
+    )
+  )
+
+  cutoff_date <- dates[
+    cutoff_position
+  ]
+
+  # Create training and test samples
+  train_data <- data[
+    data$observed_date < cutoff_date,
+  ]
+
+  test_data <- data[
+    data$observed_date >= cutoff_date,
+  ]
+
+  rownames(train_data) <- NULL
+  rownames(test_data) <- NULL
+
+  # Return datasets and split information
+  list(
+    train = train_data,
+    test = test_data,
+    cutoff_date = cutoff_date,
+    target_test_fraction = test_fraction,
+    actual_test_fraction = nrow(test_data) /
+      nrow(data)
+  )
+}
+```
+
+```{r}
+# Identify the common cutoff date from the sold-price dataset
+sold_split <- temporal_train_test_split(
+  market_data_sold_final,
+  test_fraction = 0.20
+)
+
+common_cutoff_date <- sold_split$cutoff_date
+
+common_cutoff_date
+sold_split$actual_test_fraction
+```
+
+```{r}
+# Extract the sold-price training and test datasets
+market_data_sold_train <- sold_split$train
+market_data_sold_test <- sold_split$test
+
+# Drop unused factor levels
+market_data_sold_train <- droplevels(
+  market_data_sold_train
+)
+
+market_data_sold_test <- droplevels(
+  market_data_sold_test
+)
+```
+
+```{r}
+# Order the asking-price dataset chronologically
+market_data_ask_final <- market_data_ask_final[
+  order(
+    market_data_ask_final$observed_date,
+    market_data_ask_final$market_id
+  ),
+]
+
+rownames(market_data_ask_final) <- NULL
+
+# Apply the sold-price cutoff to the asking-price dataset
+market_data_ask_train <- market_data_ask_final[
+  market_data_ask_final$observed_date < common_cutoff_date,
+]
+
+market_data_ask_test <- market_data_ask_final[
+  market_data_ask_final$observed_date >= common_cutoff_date,
+]
+
+# Drop unused factor levels
+market_data_ask_train <- droplevels(
+  market_data_ask_train
+)
+
+market_data_ask_test <- droplevels(
+  market_data_ask_test
+)
+
+rownames(market_data_ask_train) <- NULL
+rownames(market_data_ask_test) <- NULL
+```
+
+```{r}
+# Check sample sizes and test proportions
+split_size_summary <- data.frame(
+  dataset = c(
+    "Sold-price dataset",
+    "Asking-price dataset"
+  ),
+
+  total_observations = c(
+    nrow(market_data_sold_final),
+    nrow(market_data_ask_final)
+  ),
+
+  train_observations = c(
+    nrow(market_data_sold_train),
+    nrow(market_data_ask_train)
+  ),
+
+  test_observations = c(
+    nrow(market_data_sold_test),
+    nrow(market_data_ask_test)
+  )
+)
+
+split_size_summary$test_percentage <- round(
+  100 *
+    split_size_summary$test_observations /
+    split_size_summary$total_observations,
+  2
+)
+
+split_size_summary
+```
+
+```{r}
+# Summarise the temporal coverage of one train-test split
+split_period_summary <- function(
+    train_data,
+    test_data,
+    dataset_name
+) {
+
+  data.frame(
+    dataset = dataset_name,
+
+    train_observations = nrow(train_data),
+    train_first_date = min(train_data$observed_date),
+    train_last_date = max(train_data$observed_date),
+
+    test_observations = nrow(test_data),
+    test_first_date = min(test_data$observed_date),
+    test_last_date = max(test_data$observed_date)
+  )
+}
+```
+
+```{r}
+# Summarise the periods covered by the four datasets
+temporal_split_summary <- rbind(
+  split_period_summary(
+    market_data_sold_train,
+    market_data_sold_test,
+    "Sold-price dataset"
+  ),
+
+  split_period_summary(
+    market_data_ask_train,
+    market_data_ask_test,
+    "Asking-price dataset"
+  )
+)
+
+temporal_split_summary
+```
+
+
+```{r}
+###Checks
+# Define the quantitative variables to inspect
+sold_numeric_vars <- c(
+  "price_sold",
+  "age",
+  "hours",
+  "horsepower"
+)
+
+ask_numeric_vars <- c(
+  "price_ask",
+  "age",
+  "hours",
+  "horsepower"
+)
+
+
+# Create diagnostic summaries for quantitative variables
+create_numeric_diagnostics <- function(data, variables) {
+
+  bind_rows(
+    lapply(
+      variables,
+      function(variable) {
+
+        x <- data[[variable]]
+
+        q1 <- quantile(
+          x,
+          0.25,
+          na.rm = TRUE,
+          names = FALSE
+        )
+
+        q3 <- quantile(
+          x,
+          0.75,
+          na.rm = TRUE,
+          names = FALSE
+        )
+
+        variable_iqr <- q3 - q1
+
+        lower_bound <- q1 - 1.5 * variable_iqr
+        upper_bound <- q3 + 1.5 * variable_iqr
+
+        tibble(
+          variable = variable,
+          observations = sum(!is.na(x)),
+          missing_values = sum(is.na(x)),
+          negative_values = sum(x < 0, na.rm = TRUE),
+          zero_values = sum(x == 0, na.rm = TRUE),
+          minimum = min(x, na.rm = TRUE),
+          percentile_1 = quantile(
+            x,
+            0.01,
+            na.rm = TRUE,
+            names = FALSE
+          ),
+          percentile_25 = q1,
+          median = median(
+            x,
+            na.rm = TRUE
+          ),
+          mean = mean(
+            x,
+            na.rm = TRUE
+          ),
+          percentile_75 = q3,
+          percentile_99 = quantile(
+            x,
+            0.99,
+            na.rm = TRUE,
+            names = FALSE
+          ),
+          maximum = max(x, na.rm = TRUE),
+          lower_iqr_bound = lower_bound,
+          upper_iqr_bound = upper_bound,
+          iqr_outliers = sum(
+            x < lower_bound |
+              x > upper_bound,
+            na.rm = TRUE
+          )
+        )
+      }
+    )
+  )
+}
+
+# Create diagnostics for the sold-price dataset
+sold_numeric_diagnostics <- create_numeric_diagnostics(
+  market_data_sold_train,
+  sold_numeric_vars
+)
+
+# Create diagnostics for the asking-price dataset
+ask_numeric_diagnostics <- create_numeric_diagnostics(
+  market_data_ask_train,
+  ask_numeric_vars
+)
+
+print(sold_numeric_diagnostics, n = Inf)
+print(ask_numeric_diagnostics, n = Inf)
+```
+
+
+## EDA
+
+#Histograms - quantitative variables
+```{r}
+# Plot histograms for all selected quantitative variables
+plot_numeric_histograms <- function(
+    data,
+    variables,
+    dataset_title
+) {
+
+  numeric_data_long <- data %>%
+    select(
+      all_of(variables)
+    ) %>%
+    pivot_longer(
+      cols = everything(),
+      names_to = "variable",
+      values_to = "value"
+    )
+
+ggplot(
+  numeric_data_long,
+  aes(x = value)
+) +
+  geom_histogram(
+    bins = 50
+  ) +
+  facet_wrap(
+    ~ variable,
+    scales = "free",
+    ncol = 2
+  ) +
+  labs(
+    x = NULL,
+    y = "Frequency"
+  ) +
+  theme_minimal()
+}
+sold_histograms <- plot_numeric_histograms(
+  market_data_sold_train,
+  sold_numeric_vars,
+  "sold-price dataset"
+)
+
+sold_histograms
+```
+
+```{r}
+ask_histograms <- plot_numeric_histograms(
+  market_data_ask_train,
+  ask_numeric_vars,
+  "asking-price dataset"
+)
+
+ask_histograms
+```
+
+```{r}
+# Inspect the distribution and extreme quantiles
+# of the quantitative variables in the asking-price dataset
+ask_numeric_summary <- market_data_ask_train %>%
+  summarise(
+    across(
+      c(
+        price_ask,
+        age,
+        hours,
+        horsepower
+      ),
+      list(
+        min = ~ min(.x, na.rm = TRUE),
+        p01 = ~ quantile(.x, 0.01, na.rm = TRUE),
+        median = ~ median(.x, na.rm = TRUE),
+        p99 = ~ quantile(.x, 0.99, na.rm = TRUE),
+        p999 = ~ quantile(.x, 0.999, na.rm = TRUE),
+        max = ~ max(.x, na.rm = TRUE)
+      )
+    )
+  )
+
+print(n = Inf, width = Inf,  ask_numeric_summary)
+```
+
+```{r}
+
+# Display the three scatterplots side by side
+par(
+  mfrow = c(1, 3),
+  mar = c(5, 5, 4, 1)
+)
+
+# Sold price against machine age
+plot(
+  market_data_sold_train$age,
+  market_data_sold_train$price_sold,
+  pch = 16,
+  cex = 0.5,
+  xlab = "Machine age",
+  ylab = "Sold price in EUR",
+  main = "Sold price vs age"
+)
+
+# Add a non-linear trend line
+lines(
+  lowess(
+    market_data_sold_train$age,
+    market_data_sold_train$price_sold
+  ),
+  lwd = 2
+)
+
+
+# Sold price against operating hours
+plot(
+  market_data_sold_train$hours,
+  market_data_sold_train$price_sold,
+  pch = 16,
+  cex = 0.5,
+  xlab = "Operating hours",
+  ylab = "Sold price in EUR",
+  main = "Sold price vs hours"
+)
+
+lines(
+  lowess(
+    market_data_sold_train$hours,
+    market_data_sold_train$price_sold
+  ),
+  lwd = 2
+)
+
+
+# Sold price against horsepower
+plot(
+  market_data_sold_train$horsepower,
+  market_data_sold_train$price_sold,
+  pch = 16,
+  cex = 0.5,
+  xlab = "Horsepower",
+  ylab = "Sold price in EUR",
+  main = "Sold price vs horsepower"
+)
+
+lines(
+  lowess(
+    market_data_sold_train$horsepower,
+    market_data_sold_train$price_sold
+  ),
+  lwd = 2
+)
+
+# Restore the standard graphical layout
+par(mfrow = c(1, 1))
+```
+
+```{r}
+##Summary statistics for quantitative and binary variables
+
+
+summary_variables <- c(
+  "price_sold",
+  "age",
+  "hours",
+  "horsepower",
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "cab_suspension",
+  "air_conditioning",
+  "isobus"
+)
+
+# Select variables
+summary_data <- market_data_sold_train[
+  summary_variables
+]
+
+# Convert logical variables to 0/1
+summary_data[] <- lapply(
+  summary_data,
+  function(x) {
+    if (is.logical(x)) {
+      as.numeric(x)
+    } else {
+      x
+    }
+  }
+)
+
+# Calculate summary statistics
+summary_statistics <- rbind(
+  Average = sapply(summary_data, mean, na.rm = TRUE),
+  `Standard Deviation` = sapply(summary_data, sd, na.rm = TRUE),
+  Minimum = sapply(summary_data, min, na.rm = TRUE),
+  Maximum = sapply(summary_data, max, na.rm = TRUE)
+)
+
+summary_statistics <- round(
+  summary_statistics,
+  2
+)
+
+# Convert to data frame
+summary_statistics_table <- as.data.frame(
+  summary_statistics
+)
+
+# Add statistic names
+summary_statistics_table <- cbind(
+  Statistic = rownames(summary_statistics_table),
+  summary_statistics_table
+)
+
+rownames(summary_statistics_table) <- NULL
+
+# Add minimum and maximum observed dates
+summary_statistics_table$observed_date <- NA_character_
+
+summary_statistics_table$observed_date[
+  summary_statistics_table$Statistic == "Minimum"
+] <- as.character(
+  min(market_data_sold_train$observed_date, na.rm = TRUE)
+)
+
+summary_statistics_table$observed_date[
+  summary_statistics_table$Statistic == "Maximum"
+] <- as.character(
+  max(market_data_sold_train$observed_date, na.rm = TRUE)
+)
+
+summary_statistics_table
+```
+
+```{r}
+##Categorical variables
+# Define categorical variables
+categorical_variables <- c(
+  "country",
+  "make",
+  "model_series",
+  "transmission",
+  "gps"
+)
+
+# Create a summary table for categorical variables
+categorical_summary <- do.call(
+  rbind,
+  lapply(
+    categorical_variables,
+    function(variable) {
+
+      values <- market_data_sold_train[[variable]]
+
+      frequency_table <- sort(
+        table(values),
+        decreasing = TRUE
+      )
+
+      data.frame(
+        Variable = variable,
+        Levels = length(unique(values)),
+        Most_frequent_level = names(frequency_table)[1],
+        Frequency = as.integer(frequency_table[1]),
+        Percentage = round(
+          100 * as.integer(frequency_table[1]) /
+            length(values),
+          2
+        ),
+        row.names = NULL
+      )
+    }
+  )
+)
+
+categorical_summary
+```
+
+```{r}
+# Define the variables used to calculate conditional means
+conditional_variables <- c(
+  "make",
+  "model_series",
+  "country",
+  "transmission",
+  "gps",
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "isobus",
+  "source",
+  "air_conditioning",
+  "cab_suspension"
+)
+
+# Create one conditional-mean table for each variable
+conditional_means_list <- lapply(
+  conditional_variables,
+  function(variable) {
+
+    # Convert every grouping variable to character
+    # so that TRUE and FALSE are preserved correctly
+    temporary_data <- data.frame(
+      level = as.character(
+        market_data_sold_train[[variable]]
+      ),
+      price_sold = market_data_sold_train$price_sold,
+      horsepower = market_data_sold_train$horsepower
+    )
+
+    # Calculate conditional means by level
+    output <- aggregate(
+      cbind(
+        price_sold,
+        horsepower
+      ) ~ level,
+      data = temporary_data,
+      FUN = mean
+    )
+
+    # Rename columns
+    names(output) <- c(
+      "level",
+      "mean_price_sold",
+      "mean_horsepower"
+    )
+
+    # Add the conditioning-variable name
+    output$variable <- variable
+
+    # Reorder columns
+    output <- output[
+      ,
+      c(
+        "variable",
+        "level",
+        "mean_price_sold",
+        "mean_horsepower"
+      )
+    ]
+
+    # Sort levels by decreasing average sold price
+    output <- output[
+      order(
+        output$mean_price_sold,
+        decreasing = TRUE
+      ),
+    ]
+
+    rownames(output) <- NULL
+
+    output
+  }
+)
+
+# Combine all tables
+conditional_means <- do.call(
+  rbind,
+  conditional_means_list
+)
+
+rownames(conditional_means) <- NULL
+
+# Round the results
+conditional_means$mean_price_sold <- round(
+  conditional_means$mean_price_sold,
+  2
+)
+
+conditional_means$mean_horsepower <- round(
+  conditional_means$mean_horsepower,
+  2
+)
+
+conditional_means
+```
+
+```{r} 
+#Center the covariates for the interpretation of the intercept
+# Centre quantitative covariates using training-set means
+
+quantitative_covariates <- c(
+  "age",
+  "hours",
+  "horsepower"
+)
+
+# ----- Sold-price datasets -----
+
+# Calculate means using only the sold-price training dataset
+sold_training_means <- colMeans(
+  market_data_sold_train[quantitative_covariates],
+  na.rm = TRUE
+)
+
+# Create centred variables in the training and test datasets
+for (variable in quantitative_covariates) {
+
+  centered_name <- paste0(
+    variable,
+    "_centered"
+  )
+
+  market_data_sold_train[[centered_name]] <-
+    market_data_sold_train[[variable]] -
+    sold_training_means[variable]
+
+  market_data_sold_test[[centered_name]] <-
+    market_data_sold_test[[variable]] -
+    sold_training_means[variable]
+}
+
+
+# ----- Asking-price datasets -----
+
+# Calculate means using only the asking-price training dataset
+ask_training_means <- colMeans(
+  market_data_ask_train[quantitative_covariates],
+  na.rm = TRUE
+)
+
+# Create centred variables in the training and test datasets
+for (variable in quantitative_covariates) {
+
+  centered_name <- paste0(
+    variable,
+    "_centered"
+  )
+
+  market_data_ask_train[[centered_name]] <-
+    market_data_ask_train[[variable]] -
+    ask_training_means[variable]
+
+  market_data_ask_test[[centered_name]] <-
+    market_data_ask_test[[variable]] -
+    ask_training_means[variable]
+}
+```
+
+names(market_data_sold_train)
+```{r} 
+# Correlation matrix heatmap
+
+# Variables to include in the correlation matrix
+correlation_variables <- c(
+  "price_sold",
+  "age",
+  "hours",
+  "horsepower",
+  "front_pto",
+  "front_loader",
+  "front_linkage",
+  "front_axle_suspension",
+  "cab_suspension",
+  "air_conditioning",
+  "isobus"
+)
+
+# Select the variables
+correlation_data <- market_data_sold_train[
+  correlation_variables
+]
+
+# Convert logical TRUE/FALSE variables into 1/0
+correlation_data[] <- lapply(
+  correlation_data,
+  as.numeric
+)
+
+# Calculate the Pearson correlation matrix
+correlation_matrix <- cor(
+  correlation_data,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+# Display the correlation matrix
+round(correlation_matrix, 2)
+
+# Convert the matrix into long format
+correlation_long <- as.data.frame(
+  as.table(correlation_matrix)
+)
+
+names(correlation_long) <- c(
+  "row_variable",
+  "column_variable",
+  "correlation"
+)
+
+# Keep only the lower triangle
+
+correlation_long$row_index <- match(
+  as.character(correlation_long$row_variable),
+  correlation_variables
+)
+
+correlation_long$column_index <- match(
+  as.character(correlation_long$column_variable),
+  correlation_variables
+)
+
+correlation_long <- correlation_long[
+  correlation_long$row_index > correlation_long$column_index,
+]
+
+correlation_long$column_variable <- factor(
+  correlation_long$column_variable,
+  levels = correlation_variables[-length(correlation_variables)]
+)
+
+correlation_long$row_variable <- factor(
+  correlation_long$row_variable,
+  levels = rev(correlation_variables[-1])
+)
+
+
+# Create the heatmap
+
+ggplot(
+  correlation_long,
+  aes(
+    x = column_variable,
+    y = row_variable,
+    fill = correlation
+  )
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = sprintf("%.2f", correlation)),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_fixed() +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  guides(fill = "none") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      color = "black"
+    ),
+    axis.text.y = element_text(color = "black")
+  )
+```
+
+library(dplyr)
+library(ggplot2)
+
+#Median prices by month to see variation
+```{r} 
+
+# Calculate monthly median sold prices and transaction volumes
+# Monthly median sold price and number of transactions
+
+market_data_sold_train$observed_month <- as.Date(
+  format(market_data_sold_train$observed_date, "%Y-%m-01")
+)
+
+monthly_price_summary <- aggregate(
+  price_sold ~ observed_month,
+  data = market_data_sold_train,
+  FUN = function(x) median(x, na.rm = TRUE)
+)
+
+names(monthly_price_summary)[2] <- "median_price"
+
+transaction_counts <- table(market_data_sold_train$observed_month)
+
+monthly_price_summary$transactions <- as.integer(
+  transaction_counts[as.character(monthly_price_summary$observed_month)]
+)
+
+# Dates to show on the horizontal axis
+month_ticks <- seq(
+  from = min(monthly_price_summary$observed_month),
+  to = max(monthly_price_summary$observed_month),
+  by = "6 months"
+)
+
+
+# Save current graphical settings
+old_par <- par(no.readonly = TRUE)
+
+# Two plots: larger price plot and smaller transaction plot
+layout(
+  matrix(c(1, 2), ncol = 1),
+  heights = c(3, 1)
+)
+
+#------------------------------------------------------------
+# Monthly median prices
+#------------------------------------------------------------
+
+par(
+  mar = c(1, 6, 4, 2)
+)
+
+plot(
+  monthly_price_summary$observed_month,
+  monthly_price_summary$median_price,
+  type = "o",
+  pch = 16,
+  cex = 0.6,
+  lwd = 1.5,
+  xaxt = "n",
+  yaxt = "n",
+  xlab = "",
+  ylab = "",
+  main = "Monthly median realised prices"
+)
+
+# Readable EUR labels
+price_ticks <- pretty(
+  monthly_price_summary$median_price
+)
+
+axis(
+  side = 2,
+  at = price_ticks,
+  labels = format(
+    price_ticks,
+    big.mark = ",",
+    scientific = FALSE
+  ),
+  las = 1
+)
+
+mtext(
+  "Median sold price (EUR)",
+  side = 2,
+  line = 4
+)
+
+#------------------------------------------------------------
+# Number of realised sales
+#------------------------------------------------------------
+
+par(
+  mar = c(5, 6, 1, 2)
+)
+
+plot(
+  monthly_price_summary$observed_month,
+  monthly_price_summary$transactions,
+  type = "h",
+  lwd = 8,
+  xaxt = "n",
+  xlab = "",
+  ylab = "",
+  ylim = c(
+    0,
+    max(monthly_price_summary$transactions) * 1.05
+  )
+)
+
+axis.Date(
+  side = 1,
+  at = month_ticks,
+  format = "%b\n%Y"
+)
+
+mtext(
+  "Month",
+  side = 1,
+  line = 3
+)
+
+mtext(
+  "Monthly Transaction Volume",
+  side = 2,
+  line = 4
+)
+
+# Restore the original graphical settings
+layout(1)
+par(old_par)
+```
+
+names(market_data_sold_train)
+###Modelling phase
+
+```{r} 
+#------------------------------------------------------------
+# Combined dataset for all INLA models
+#------------------------------------------------------------
+n_train <- nrow(market_data_sold_train)
+n_test <- nrow(market_data_sold_test)
+
+# Add the response used for model estimation
+market_data_train_inla <- market_data_sold_train
+market_data_train_inla$log_price <- log(market_data_train_inla$price_sold)
+
+# Test outcomes are not used for model estimation
+market_data_test_inla <- market_data_sold_test
+market_data_test_inla$log_price <- NA_real_
+
+# Combine training and test observations
+market_data_inla <- rbind(
+  market_data_train_inla,
+  market_data_test_inla
+)
+
+```
+
+```{r} 
+#------------------------------------------------------------
+# Evaluation function for any INLA model
+#------------------------------------------------------------
+
+evaluate_inla_model <- function(
+  model,
+  train_data,
+  test_data,
+  response_variable = "price_sold",
+  response_transformation = log,
+  model_name = "Model"
+) {
+
+  # Sample sizes
+  n_train <- nrow(train_data)
+  n_test  <- nrow(test_data)
+  n_total <- n_train + n_test
+
+  # Check that fitted values were computed
+  if (is.null(model$summary.fitted.values)) {
+    stop(
+      "Fitted values are unavailable. ",
+      "Use control.predictor = list(compute = TRUE, link = 1)."
+    )
+  }
+
+  # Extract posterior mean fitted values
+  predicted_all <- model$summary.fitted.values$mean
+
+  # The model must contain both train and test observations
+  if (length(predicted_all) != n_total) {
+    stop(
+      "The number of fitted values does not equal ",
+      "the combined number of train and test observations. ",
+      "Fit the model using market_data_inla."
+    )
+  }
+
+  # Separate train and test predictions
+  predicted_train <- predicted_all[
+    seq_len(n_train)
+  ]
+
+  predicted_test <- predicted_all[
+    n_train + seq_len(n_test)
+  ]
+
+  # Transform the observed response onto the model scale
+  transform_function <- match.fun(
+    response_transformation
+  )
+
+  observed_train <- transform_function(
+    train_data[[response_variable]]
+  )
+
+  observed_test <- transform_function(
+    test_data[[response_variable]]
+  )
+
+  # Check lengths and finite values
+  if (length(observed_train) != length(predicted_train)) {
+    stop("Train observed and predicted values have different lengths.")
+  }
+
+  if (length(observed_test) != length(predicted_test)) {
+    stop("Test observed and predicted values have different lengths.")
+  }
+
+  if (
+    any(!is.finite(observed_train)) ||
+    any(!is.finite(observed_test)) ||
+    any(!is.finite(predicted_train)) ||
+    any(!is.finite(predicted_test))
+  ) {
+    stop("Observed or predicted values contain non-finite values.")
+  }
+
+  # Function for predictive metrics
+  calculate_metrics <- function(
+    observed,
+    predicted
+  ) {
+
+    residuals <- observed - predicted
+
+    sse <- sum(
+      residuals^2
+    )
+
+    tss <- sum(
+      (observed - mean(observed))^2
+    )
+
+    if (tss <= .Machine$double.eps) {
+      stop("The response has no variability.")
+    }
+
+    data.frame(
+      N = length(observed),
+
+      R2 = 1 - sse / tss,
+
+      RMSE_model_scale = sqrt(
+        mean(residuals^2)
+      ),
+
+      MAE_model_scale = mean(
+        abs(residuals)
+      ),
+
+      SSE = sse,
+      TSS = tss
+    )
+  }
+
+  # Train and test metrics
+  train_metrics <- calculate_metrics(
+    observed_train,
+    predicted_train
+  )
+
+  test_metrics <- calculate_metrics(
+    observed_test,
+    predicted_test
+  )
+
+  predictive_metrics <- rbind(
+    cbind(
+      Model = model_name,
+      Dataset = "Train",
+      train_metrics
+    ),
+
+    cbind(
+      Model = model_name,
+      Dataset = "Test",
+      test_metrics
+    )
+  )
+
+  rownames(predictive_metrics) <- NULL
+
+  # Safely extract DIC and WAIC
+  dic_value <- if (
+    is.null(model$dic$dic)
+  ) {
+    NA_real_
+  } else {
+    model$dic$dic
+  }
+
+  waic_value <- if (
+    is.null(model$waic$waic)
+  ) {
+    NA_real_
+  } else {
+    model$waic$waic
+  }
+
+  # Calculate NLSCPO using training observations only
+  if (is.null(model$cpo$cpo)) {
+
+    nlscpo_value <- NA_real_
+    mean_nlscpo_value <- NA_real_
+    invalid_cpo <- NA_integer_
+
+  } else {
+
+    cpo_train <- model$cpo$cpo[
+      seq_len(n_train)
+    ]
+
+    valid_cpo <- is.finite(cpo_train) &
+      cpo_train > 0
+
+    invalid_cpo <- sum(
+      !valid_cpo
+    )
+
+    if (!any(valid_cpo)) {
+
+      nlscpo_value <- NA_real_
+      mean_nlscpo_value <- NA_real_
+
+    } else {
+
+      nlscpo_value <- -sum(
+        log(cpo_train[valid_cpo])
+      )
+
+      mean_nlscpo_value <- -mean(
+        log(cpo_train[valid_cpo])
+      )
+    }
+  }
+
+  model_criteria <- data.frame(
+    Model = model_name,
+    DIC = dic_value,
+    WAIC = waic_value,
+    NLSCPO = nlscpo_value,
+    Mean_NLSCPO = mean_nlscpo_value,
+    Invalid_CPO = invalid_cpo
+  )
+
+  # Return results and predictions
+  list(
+    predictive_metrics = predictive_metrics,
+    model_criteria = model_criteria,
+
+    observed_train = observed_train,
+    predicted_train = predicted_train,
+
+    observed_test = observed_test,
+    predicted_test = predicted_test
+  )
+}
+```
+
+```{r} 
+##Fixed effects model
+#------------------------------------------------------------
+# Model 1: Gaussian linear regression with fixed effects
+#------------------------------------------------------------
+
+# Diffuse priors for the intercept and fixed-effect coefficients
+prior_fixed_m1 <- list(
+  mean.intercept = 0,
+  prec.intercept = 1e-10,
+  mean = 0,
+  prec = 1e-8
+)
+
+# Diffuse prior for the residual precision
+prior_residual_m1 <- list(
+  prec = list(
+    prior = "loggamma",
+    param = c(0.001, 0.001)
+  )
+)
+
+# Model formula
+formula_m1 <- log_price ~
+  age_centered +
+  hours_centered + 
+  I(hours_centered^2) +
+  horsepower_centered +
+  I(horsepower_centered^2) +
+  transmission +
+  gps +  
+  front_pto +
+  front_loader +
+  front_linkage +
+  front_axle_suspension +
+  cab_suspension +
+  air_conditioning +
+  isobus
+
+# Fit Model 1
+m1 <- inla(
+  formula_m1,
+  family = "gaussian",
+  data = market_data_inla,
+
+  control.fixed = prior_fixed_m1,
+
+  control.family = list(
+    hyper = prior_residual_m1
+  ),
+
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+  ),
+
+  control.predictor = list(
+    compute = TRUE,
+    link = 1
+  )
+)
+```
+
+```{r} 
+evaluation_m1 <- evaluate_inla_model(
+  model = m1,
+  train_data = market_data_sold_train,
+  test_data = market_data_sold_test,
+  response_variable = "price_sold",
+  response_transformation = log,
+  model_name = "Model 1"
+)
+```
+
+```{r}
+# Display predictive metrics
+print(
+  evaluation_m1$predictive_metrics
+)
+
+# Display Bayesian model-comparison criteria
+print(
+  evaluation_m1$model_criteria
+)
+
+summary(m1)
+```
+
+```{r} 
+# PC prior for random-effect precisions
+#
+# P(random-effect SD > 0.5) = 0.05
+prior_random_m2 <- list(
+  prec = list(
+    prior = "pc.prec",
+    param = c(0.5, 0.05)
+  )
+)
+```
+
+```{r}
+formula_m2 <- log_price ~
+  age_centered +
+  hours_centered +
+  I(hours_centered^2) +
+  horsepower_centered +
+  I(horsepower_centered^2) +
+  transmission +
+  gps +
+  front_pto +
+  front_loader +
+  front_linkage +
+  front_axle_suspension +
+  cab_suspension +
+  air_conditioning +
+  isobus +
+  f(
+    make_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+  f(
+    model_series_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+  f(
+    country_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  )
+```
+
+```{r}
+m2 <- inla(
+  formula_m2,
+  family = "gaussian",
+  data = market_data_inla,
+
+  control.fixed = prior_fixed_m1,
+
+  control.family = list(
+    hyper = prior_residual_m1
+  ),
+
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE
+  ),
+
+  control.predictor = list(
+    compute = TRUE,
+    link = 1
+  )
+)
+```
+
+```{r}
+evaluation_m2 <- evaluate_inla_model(
+  model = m2,
+  train_data = market_data_sold_train,
+  test_data = market_data_sold_test,
+  response_variable = "price_sold",
+  response_transformation = log,
+  model_name = "Model 2"
+)
+```
+
+```{r}
+# Display predictive metrics
+print(
+  evaluation_m2$predictive_metrics
+)
+
+# Display Bayesian model-comparison criteria
+print(
+  evaluation_m2$model_criteria
+)
+```
+
+#Model3
+```{r}
+#------------------------------------------------------------
+# Create monthly time index
+#------------------------------------------------------------
+
+# Convert each date into the first day of its month
+market_data_inla$observed_month <- as.Date(
+  format(
+    market_data_inla$observed_date,
+    "%Y-%m-01"
+  )
+)
+
+# Complete sequence of calendar months
+all_months_m3 <- seq.Date(
+  from = min(
+    market_data_inla$observed_month,
+    na.rm = TRUE
+  ),
+  to = max(
+    market_data_inla$observed_month,
+    na.rm = TRUE
+  ),
+  by = "month"
+)
+
+# Match each observation to its calendar month
+market_data_inla$time_id <- match(
+  market_data_inla$observed_month,
+  all_months_m3
+)
+
+# Number of months in the temporal process
+n_time_m3 <- length(all_months_m3)
+```
+
+```{r}
+#------------------------------------------------------------
+# PC prior for the temporal RW1 effect
+#------------------------------------------------------------
+
+# P(temporal-effect SD > 0.20) = 0.05
+prior_time_m3 <- list(
+  prec = list(
+    prior = "pc.prec",
+    param = c(0.20, 0.05)
+  )
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Model 3: random intercepts and monthly RW1 temporal effect
+#------------------------------------------------------------
+
+formula_m3 <- log_price ~
+  age_centered +
+  hours_centered +
+  I(hours_centered^2) +
+  horsepower_centered +
+  I(horsepower_centered^2) +
+  transmission +
+  gps +
+  front_pto +
+  front_loader +
+  front_linkage +
+  front_axle_suspension +
+  cab_suspension +
+  air_conditioning +
+  isobus +
+
+  # Random intercept for manufacturer
+  f(
+    make_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Random intercept for model series
+  f(
+    model_series_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Random intercept for country
+  f(
+    country_id,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Monthly temporal effect
+  f(
+    time_id,
+    model = "rw1",
+    values = seq_len(n_time_m3),
+    constr = TRUE,
+    scale.model = TRUE,
+    hyper = prior_time_m3
+  )
+```
+
+```{r}
+m3 <- inla(
+  formula_m3,
+  family = "gaussian",
+  data = market_data_inla,
+
+  # Same fixed-effect priors as previous models
+  control.fixed = prior_fixed_m1,
+
+  # Same residual precision prior
+  control.family = list(
+    hyper = prior_residual_m1
+  ),
+
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE,
+    config = TRUE
+  ),
+
+  control.predictor = list(
+    compute = TRUE,
+    link = 1
+  )
+)
+```
+
+```{r}
+evaluation_m3 <- evaluate_inla_model(
+  model = m3,
+  train_data = market_data_sold_train,
+  test_data = market_data_sold_test,
+  response_variable = "price_sold",
+  response_transformation = log,
+  model_name = "Model 3"
+)
+
+# R2, RMSE and MAE for train and test
+evaluation_m3$predictive_metrics
+
+# DIC, WAIC, NLSCPO and marginal log-likelihood
+evaluation_m3$model_criteria
+```
+
+```{r}
+#------------------------------------------------------------
+# Plot the monthly RW1 temporal effect
+#------------------------------------------------------------
+
+# Extract posterior summaries
+temporal_effect_m3 <- as.data.frame(
+  m3$summary.random$time_id
+)
+
+# Associate each time index with its calendar month
+temporal_effect_m3$observed_month <- all_months_m3[
+  temporal_effect_m3$ID
+]
+
+# Month corresponding to the train-test cutoff
+cutoff_month <- as.Date(
+  format(common_cutoff_date, "%Y-%m-01")
+)
+
+# Separate data frame for cutoff line
+cutoff_df <- data.frame(
+  cutoff_month = cutoff_month
+)
+
+#------------------------------------------------------------
+# Create plot
+#------------------------------------------------------------
+
+temporal_effect_plot <- ggplot(
+  temporal_effect_m3,
+  aes(x = observed_month)
+) +
+
+  # Posterior mean
+  geom_line(
+    aes(
+      y = mean,
+      linetype = "Posterior mean",
+      colour = "Posterior mean"
+    ),
+    linewidth = 0.8
+  ) +
+
+  # Lower 95% credible interval
+  geom_line(
+    aes(
+      y = `0.025quant`,
+      linetype = "95% credible interval",
+      colour = "95% credible interval"
+    ),
+    linewidth = 0.45
+  ) +
+
+  # Upper 95% credible interval
+  geom_line(
+    aes(
+      y = `0.975quant`,
+      linetype = "95% credible interval",
+      colour = "95% credible interval"
+    ),
+    linewidth = 0.45
+  ) +
+
+  # Zero reference line
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    colour = "grey50",
+    show.legend = FALSE
+  ) +
+
+  # Train-test cutoff
+  geom_vline(
+    data = cutoff_df,
+    aes(
+      xintercept = cutoff_month,
+      linetype = "Train-test cutoff",
+      colour = "Train-test cutoff"
+    ),
+    linewidth = 0.5,
+    show.legend = TRUE,
+    key_glyph = "path"
+  ) +
+
+  #----------------------------------------------------------
+  # Line types
+  #----------------------------------------------------------
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c(
+      "Posterior mean" = "solid",
+      "95% credible interval" = "dotted",
+      "Train-test cutoff" = "dotted"
+    ),
+    breaks = c(
+      "Posterior mean",
+      "95% credible interval",
+      "Train-test cutoff"
+    )
+  ) +
+
+  #----------------------------------------------------------
+  # Colours
+  #----------------------------------------------------------
+
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "Posterior mean" = "black",
+      "95% credible interval" = "black",
+      "Train-test cutoff" = "red"
+    ),
+    breaks = c(
+      "Posterior mean",
+      "95% credible interval",
+      "Train-test cutoff"
+    )
+  ) +
+
+  #----------------------------------------------------------
+  # X axis
+  #----------------------------------------------------------
+
+  scale_x_date(
+    date_breaks = "2 months",
+    date_labels = "%b\n%Y",
+    expand = expansion(
+      mult = c(0.03, 0.03)
+    )
+  ) +
+
+  labs(
+    title = "Estimated monthly RW1 temporal effect",
+    x = "Month",
+    y = "Temporal effect on log sold price"
+  ) +
+
+  #----------------------------------------------------------
+  # Theme
+  #----------------------------------------------------------
+
+  theme_classic() +
+
+  theme(
+    # Title
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 13
+    ),
+
+    # Axis titles
+    axis.title = element_text(
+      size = 11
+    ),
+
+    # Axis labels
+    axis.text = element_text(
+      size = 9,
+      colour = "black"
+    ),
+
+    # Black border around plotting area
+    panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.5
+    ),
+
+    # Remove duplicate axis lines
+    axis.line = element_blank(),
+
+    # Legend inside top-right
+    legend.position = c(0.84, 0.88),
+
+    legend.background = element_blank(),
+
+    legend.key = element_blank(),
+
+    legend.text = element_text(
+      size = 10
+    ),
+
+    # Legend line dimensions
+    legend.key.width = grid::unit(
+      1.2,
+      "cm"
+    ),
+
+    legend.key.height = grid::unit(
+      0.4,
+      "cm"
+    ),
+
+    # Plot margins
+    plot.margin = margin(
+      20,
+      20,
+      15,
+      15
+    )
+  )
+
+#------------------------------------------------------------
+# Display plot
+#------------------------------------------------------------
+
+temporal_effect_plot
+
+
+#------------------------------------------------------------
+# Save plot
+#------------------------------------------------------------
+
+# PNG version
+ggsave(
+  filename = "temporal_effect_m3.png",
+  plot = temporal_effect_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+# PDF vector version for Overleaf
+ggsave(
+  filename = "temporal_effect_m3.pdf",
+  plot = temporal_effect_plot,
+  width = 10,
+  height = 6
+)
+```
+
+###Model 4
+```{r}
+#------------------------------------------------------------
+# Model 4: prepare joint sold-asking dataset
+#------------------------------------------------------------
+
+prepare_m4_data <- function(
+  data,
+  price_variable,
+  outcome,
+  sample
+) {
+
+  data %>%
+    mutate(
+      price_value = .data[[price_variable]],
+      outcome = outcome,
+      sample = sample
+    ) %>%
+    select(
+      -any_of(
+        c(
+          "price_sold",
+          "price_ask"
+        )
+      )
+    )
+}
+
+# Combine the four datasets
+market_data_m4 <- bind_rows(
+  prepare_m4_data(
+    market_data_sold_train,
+    price_variable = "price_sold",
+    outcome = "sold",
+    sample = "train"
+  ),
+
+  prepare_m4_data(
+    market_data_sold_test,
+    price_variable = "price_sold",
+    outcome = "sold",
+    sample = "test"
+  ),
+
+  prepare_m4_data(
+    market_data_ask_train,
+    price_variable = "price_ask",
+    outcome = "ask",
+    sample = "train"
+  ),
+
+  prepare_m4_data(
+    market_data_ask_test,
+    price_variable = "price_ask",
+    outcome = "ask",
+    sample = "test"
+  )
+)
+```
+
+table(
+  market_data_m4$outcome,
+  market_data_m4$sample
+)
+
+```{r}
+# Means calculated only from sold-price training observations
+m4_training_means <- colMeans(
+  market_data_sold_train[
+    c(
+      "age",
+      "hours",
+      "horsepower"
+    )
+  ]
+)
+
+market_data_m4 <- market_data_m4 %>%
+  mutate(
+    age_centered_m4 =
+      age -
+      m4_training_means["age"],
+
+    hours_centered_m4 =
+      hours -
+      m4_training_means["hours"],
+
+    horsepower_centered_m4 =
+      horsepower -
+      m4_training_means["horsepower"]
+  )
+```
+
+```{r}
+# Convert relevant labels to character before creating common IDs
+market_data_m4 <- market_data_m4 %>%
+  mutate(
+    make = as.character(make),
+    model_series = as.character(model_series),
+    country = as.character(country),
+    source = as.character(source)
+  )
+
+# Common IDs across sold and asking observations
+market_data_m4 <- market_data_m4 %>%
+  mutate(
+    make_id_m4 = as.integer(
+      factor(make)
+    ),
+
+    model_series_id_m4 = as.integer(
+      factor(model_series)
+    ),
+
+    country_id_m4 = as.integer(
+      factor(country)
+    )
+  )
+```
+
+```{r}
+# Source levels observed among asking-price listings
+ask_source_levels_m4 <- sort(
+  unique(
+    market_data_m4$source[
+      market_data_m4$outcome == "ask"
+    ]
+  )
+)
+
+# Asking-specific source index
+market_data_m4$source_ask_id_m4 <- ifelse(
+  market_data_m4$outcome == "ask",
+  match(
+    market_data_m4$source,
+    ask_source_levels_m4
+  ),
+  NA_integer_
+)
+
+# Asking-price indicator
+market_data_m4$ask_indicator <- as.integer(
+  market_data_m4$outcome == "ask"
+)
+```
+
+```{r}
+# Assign each observation to its calendar month
+market_data_m4$observed_month <- as.Date(
+  format(
+    market_data_m4$observed_date,
+    "%Y-%m-01"
+  )
+)
+
+# Complete monthly sequence
+all_months_m4 <- seq.Date(
+  from = min(
+    market_data_m4$observed_month
+  ),
+  to = max(
+    market_data_m4$observed_month
+  ),
+  by = "month"
+)
+
+# Common monthly index
+market_data_m4$time_id_m4 <- match(
+  market_data_m4$observed_month,
+  all_months_m4
+)
+
+n_time_m4 <- length(
+  all_months_m4
+)
+```
+
+```{r}
+
+#------------------------------------------------------------
+# Two-column response matrix
+#------------------------------------------------------------
+
+Y_m4 <- matrix(
+  NA_real_,
+  nrow = nrow(market_data_m4),
+  ncol = 2
+)
+
+colnames(Y_m4) <- c(
+  "sold",
+  "ask"
+)
+
+# Training-row indicators
+sold_train_m4 <-
+  market_data_m4$outcome == "sold" &
+  market_data_m4$sample == "train"
+
+ask_train_m4 <-
+  market_data_m4$outcome == "ask" &
+  market_data_m4$sample == "train"
+
+# Observed responses
+Y_m4[sold_train_m4, "sold"] <- log(
+  market_data_m4$price_value[
+    sold_train_m4
+  ]
+)
+
+Y_m4[ask_train_m4, "ask"] <- log(
+  market_data_m4$price_value[
+    ask_train_m4
+  ]
+)
+```
+
+```{r}
+likelihood_id_m4 <- ifelse(
+  market_data_m4$outcome == "sold",
+  1L,
+  2L
+)
+```
+
+```{r}
+inla_data_m4 <- c(
+  as.list(market_data_m4),
+  list(
+    Y_m4 = Y_m4
+  )
+)
+```
+
+```{r}
+# P(source-effect SD > 0.20) = 0.05
+prior_source_m4 <- list(
+  prec = list(
+    prior = "pc.prec",
+    param = c(0.20, 0.05)
+  )
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Model 4: joint sold-asking price model
+#------------------------------------------------------------
+
+formula_m4 <- Y_m4 ~
+  age_centered_m4 +
+  hours_centered_m4 +
+  I(hours_centered_m4^2) +
+  horsepower_centered_m4 +
+  I(horsepower_centered_m4^2) +
+  transmission +
+  gps +
+  front_pto +
+  front_loader +
+  front_linkage +
+  front_axle_suspension +
+  cab_suspension +
+  air_conditioning +
+  isobus +
+
+  # Average asking-price markup: alpha_ask
+  ask_indicator +
+
+  # Shared manufacturer random intercept
+  f(
+    make_id_m4,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Shared model-series random intercept
+  f(
+    model_series_id_m4,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Shared country random intercept
+  f(
+    country_id_m4,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_random_m2
+  ) +
+
+  # Shared monthly RW1 effect
+  f(
+    time_id_m4,
+    model = "rw1",
+    values = seq_len(n_time_m4),
+    constr = TRUE,
+    scale.model = TRUE,
+    hyper = prior_time_m3
+  ) +
+
+  # Asking-specific source effect: gamma_source
+  f(
+    source_ask_id_m4,
+    model = "iid",
+    constr = TRUE,
+    hyper = prior_source_m4
+  )
+  ```
+
+ ```{r}
+#------------------------------------------------------------
+# Fit Model 4
+#------------------------------------------------------------
+
+m4 <- inla(
+  formula_m4,
+
+  # Separate Gaussian likelihoods for sold and asking prices
+  family = c(
+    "gaussian",
+    "gaussian"
+  ),
+
+  data = inla_data_m4,
+
+  control.fixed = prior_fixed_m1,
+
+  # Separate residual precision for the two likelihoods
+  control.family = list(
+    list(
+      hyper = prior_residual_m1
+    ),
+    list(
+      hyper = prior_residual_m1
+    )
+  ),
+
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE,
+    config = FALSE
+  ),
+
+  control.predictor = list(
+    compute = TRUE,
+    link = likelihood_id_m4
+  )
+)
+ ```
+
+ ```{r}
+ #------------------------------------------------------------
+# Evaluation of the joint model
+#------------------------------------------------------------
+
+evaluate_joint_inla_model <- function(
+  model,
+  joint_data,
+  model_name = "Model 4"
+) {
+
+  predicted <- model$summary.fitted.values$mean
+
+  if (length(predicted) != nrow(joint_data)) {
+    stop(
+      "The number of predictions does not match ",
+      "the number of observations."
+    )
+  }
+
+  calculate_metrics <- function(
+    observed,
+    predicted
+  ) {
+
+    residuals <- observed - predicted
+
+    sse <- sum(
+      residuals^2
+    )
+
+    tss <- sum(
+      (observed - mean(observed))^2
+    )
+
+    data.frame(
+      N = length(observed),
+      R2 = 1 - sse / tss,
+      RMSE_model_scale = sqrt(
+        mean(residuals^2)
+      ),
+      MAE_model_scale = mean(
+        abs(residuals)
+      )
+    )
+  }
+
+  groups <- list(
+    Sold_train =
+      joint_data$outcome == "sold" &
+      joint_data$sample == "train",
+
+    Sold_test =
+      joint_data$outcome == "sold" &
+      joint_data$sample == "test",
+
+    Ask_train =
+      joint_data$outcome == "ask" &
+      joint_data$sample == "train",
+
+    Ask_test =
+      joint_data$outcome == "ask" &
+      joint_data$sample == "test"
+  )
+
+  results <- do.call(
+    rbind,
+    lapply(
+      names(groups),
+      function(group_name) {
+
+        index <- groups[[group_name]]
+
+        group_results <- calculate_metrics(
+          observed = log(
+            joint_data$price_value[index]
+          ),
+          predicted = predicted[index]
+        )
+
+        cbind(
+          Model = model_name,
+          Dataset = group_name,
+          group_results
+        )
+      }
+    )
+  )
+
+  rownames(results) <- NULL
+
+  results
+}
+ ```
+
+ ```{r}
+ evaluation_m4 <- evaluate_joint_inla_model(
+  model = m4,
+  joint_data = market_data_m4,
+  model_name = "Model 4"
+)
+
+evaluation_m4
+ ```
+
+  ```{r}
+ evaluation_m4[
+  evaluation_m4$Dataset == "Sold_test",
+]
+ ```
+
+summary(m1)
+summary(m2)
+summary(m3)
+summary(m4)
+
+```{r}
+#------------------------------------------------------------
+# Residual diagnostics for Model 3
+#------------------------------------------------------------
+
+# Observed and fitted values on the model scale
+observed_log_m3 <- log(
+  market_data_sold_train$price_sold
+)
+
+fitted_log_m3 <- evaluation_m3$predicted_train
+
+# Residuals
+residuals_m3 <- observed_log_m3 - fitted_log_m3
+
+# Posterior mean of residual precision
+residual_precision_m3 <- m3$summary.hyperpar[
+  "Precision for the Gaussian observations",
+  "mean"
+]
+
+# Approximate residual standard deviation
+residual_sd_m3 <- sqrt(
+  1 / residual_precision_m3
+)
+
+# Standardized residuals
+standardized_residuals_m3 <-
+  residuals_m3 / residual_sd_m3
+
+
+#------------------------------------------------------------
+# Diagnostic plots
+#------------------------------------------------------------
+
+old_par <- par(
+  mfrow = c(1, 2),
+  mar = c(5, 5, 4, 2)
+)
+
+# 1. Normal Q-Q plot
+qqnorm(
+  standardized_residuals_m3,
+  pch = 1,
+  cex = 0.6,
+  main = "Normal Q-Q plot",
+  xlab = "Theoretical quantiles",
+  ylab = "Standardized residuals"
+)
+
+qqline(
+  standardized_residuals_m3,
+  lty = 2,
+  lwd = 2
+)
+
+
+# 2. Standardized residuals against fitted values
+plot(
+  fitted_log_m3,
+  standardized_residuals_m3,
+  pch = 1,
+  cex = 0.5,
+  xlab = "Fitted log sold price",
+  ylab = "Standardized residuals",
+  main = "Residuals vs fitted values"
+)
+
+abline(
+  h = 0,
+  lty = 2
+)
+
+# Smooth line to identify systematic patterns
+lines(
+  lowess(
+    fitted_log_m3,
+    standardized_residuals_m3
+  ),
+  lwd = 2
+)
+
+par(old_par)
+```
+
+
+```{r}
+##Robust 5th model
+#------------------------------------------------------------
+# Model 5: Student-t likelihood priors
+#------------------------------------------------------------
+
+prior_residual_m5 <- list(
+
+  # Same residual precision prior as Model 3
+  prec = prior_residual_m1$prec,
+  # PC prior for the degrees of freedom
+  # Degrees of freedom are estimated from the data
+  dof = list(initial=log(7-2), fixed=TRUE))
+```
+
+```{r}
+#------------------------------------------------------------
+# Model 5: robust extension of Model 3
+#------------------------------------------------------------
+formula_m5 <- formula_m3
+```
+
+```{r}
+#------------------------------------------------------------
+# Fit Model 5
+#------------------------------------------------------------
+
+m5 <- inla(
+  formula_m5,
+
+  # Student-t likelihood
+  family = "T",
+
+  data = market_data_inla,
+
+  # Same fixed-effect priors as Model 3
+  control.fixed = prior_fixed_m1,
+
+  # Residual precision and degrees-of-freedom priors
+  control.family = list(
+    hyper = prior_residual_m5
+  ),
+
+  control.compute = list(
+    dic = TRUE,
+    waic = TRUE,
+    cpo = TRUE,
+    config = TRUE
+  ),
+
+  control.predictor = list(
+    compute = TRUE,
+    link = 1
+  )
+)
+```
+glimpse(market_data_inla)
+dim(market_data_inla)
+```{r}
+#------------------------------------------------------------
+# Evaluate Model 5
+#------------------------------------------------------------
+
+evaluation_m5 <- evaluate_inla_model(
+  model = m5,
+  train_data = market_data_sold_train,
+  test_data = market_data_sold_test,
+  response_variable = "price_sold",
+  response_transformation = log,
+  model_name = "Model 5"
+)
+
+# R2, RMSE and MAE for train and test
+evaluation_m5$predictive_metrics
+
+# DIC, WAIC, NLSCPO and marginal log-likelihood
+evaluation_m5$model_criteria
+```
+summary(m5)
+###PIT  
+```{r}
+#------------------------------------------------------------
+# Compare leave-one-out PIT distributions for sold prices
+#------------------------------------------------------------
+
+# Number of sold-price training observations
+n_sold_train <- nrow(
+  market_data_sold_train
+)
+
+# Extract PIT values for the same sold training observations
+pit_m1 <- m1$cpo$pit[
+  seq_len(n_sold_train)
+]
+
+pit_m2 <- m2$cpo$pit[
+  seq_len(n_sold_train)
+]
+
+pit_m3 <- m3$cpo$pit[
+  seq_len(n_sold_train)
+]
+
+# In M4, select only sold-price training rows
+pit_m4 <- m4$cpo$pit[
+  sold_train_m4
+]
+
+pit_m5 <- m5$cpo$pit[seq_len(n_sold_train)]
+
+# Combine PIT values
+pit_comparison <- bind_rows(
+  data.frame(
+    Model = "Model 1",
+    PIT = pit_m1
+  ),
+
+  data.frame(
+    Model = "Model 2",
+    PIT = pit_m2
+  ),
+
+  data.frame(
+    Model = "Model 3",
+    PIT = pit_m3
+  ),
+
+  data.frame(
+    Model = "Model 4",
+    PIT = pit_m4
+  ),
+
+  data.frame(
+    Model = "Model 5",
+    PIT = pit_m5
+  )
+  
+
+) %>%
+  filter(
+    is.finite(PIT),
+    PIT >= 0,
+    PIT <= 1
+  )
+
+# Check the number of valid PIT values
+table(
+  pit_comparison$Model
+)
+ ```
+
+ ```{r}
+ ggplot(
+  pit_comparison,
+  aes(x = PIT)
+) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    breaks = seq(
+      0,
+      1,
+      by = 0.10
+    ),
+    boundary = 0
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed"
+  ) +
+  facet_wrap(
+    ~ Model,
+    ncol = 2
+  ) +
+  coord_cartesian(
+    xlim = c(0, 1)
+  ) +
+  labs(
+    title = "Leave-one-out PIT distributions for realised prices",
+    subtitle = "The dashed line represents the Uniform(0,1) density",
+    x = "PIT",
+    y = "Density"
+  ) +
+  theme_minimal()
+ ```
+
+summary(m1)
+summary(m2)
+summary(m3)
+summary(m4)
+summary(m5)
+#####
+
+ ```{r}
+##ICC model 5
+#------------------------------------------------------------
+# ICCs for the IID random effects in Model 5
+# Time effect is excluded
+#------------------------------------------------------------------------------------------------------------
+
+# Extract posterior mean precisions
+precision_residual_m5 <- m5$summary.hyperpar[
+  "precision for the student-t observations",
+  "mean"
+]
+
+precision_make_m5 <- m5$summary.hyperpar[
+  "Precision for make_id",
+  "mean"
+]
+
+precision_model_m5 <- m5$summary.hyperpar[
+  "Precision for model_series_id",
+  "mean"
+]
+
+precision_country_m5 <- m5$summary.hyperpar[
+  "Precision for country_id",
+  "mean"
+]
+
+# Convert precisions into variances
+variance_residual_m5 <- 1 / precision_residual_m5
+variance_make_m5 <- 1 / precision_make_m5
+variance_model_m5 <- 1 / precision_model_m5
+variance_country_m5 <- 1 / precision_country_m5
+
+# Total variance excluding the temporal effect
+total_variance_m5 <-
+  variance_residual_m5 +
+  variance_make_m5 +
+  variance_model_m5 +
+  variance_country_m5
+
+# Calculate ICCs
+icc_results_m5 <- data.frame(
+  Component = c(
+    "Make",
+    "Model series",
+    "Country"
+  ),
+
+  ICC = c(
+    variance_make_m5 / total_variance_m5,
+    variance_model_m5 / total_variance_m5,
+    variance_country_m5 / total_variance_m5
+  )
+)
+
+icc_results_m5
+ ```
+
+ ```{r}
+#------------------------------------------------------------
+# Monthly RW1 temporal effect for Model 5
+#------------------------------------------------------------
+
+time_effect_m5 <- m5$summary.random$time_id
+
+# Associate each index with its calendar month
+time_effect_m5$month <- all_months_m3[
+  time_effect_m5$ID
+]
+
+plot(
+  time_effect_m5$month,
+  time_effect_m5$mean,
+  type = "l",
+  lwd = 2,
+  xlab = "Month",
+  ylab = "Temporal effect on log sold price",
+  main = "Estimated monthly RW1 temporal effect",
+  ylim = range(
+    time_effect_m5$`0.025quant`,
+    time_effect_m5$`0.975quant`
+  )
+)
+
+# 95% credible interval
+lines(
+  time_effect_m5$month,
+  time_effect_m5$`0.025quant`,
+  lty = 3
+)
+
+lines(
+  time_effect_m5$month,
+  time_effect_m5$`0.975quant`,
+  lty = 3
+)
+
+# Zero reference line
+abline(
+  h = 0,
+  lty = 2
+)
+
+# Train-test cutoff
+abline(
+  v = as.numeric(common_cutoff_date),
+  lty = 3
+)
+
+legend(
+  "topright",
+  legend = c(
+    "Posterior mean",
+    "95% credible interval",
+    "Train-test cutoff"
+  ),
+  lty = c(1, 3, 3),
+  lwd = c(2, 1, 1),
+  bty = "n"
+)
+ ```
+
+ ```{r}
+#------------------------------------------------------------
+# Prepare random effects
+#------------------------------------------------------------
+
+prepare_random_effect <- function(
+  random_summary,
+  id_variable,
+  label_variable
+) {
+
+  level_map <- unique(
+    data.frame(
+      ID = id_variable,
+      Label = as.character(label_variable)
+    )
+  )
+
+  merge(
+    random_summary,
+    level_map,
+    by = "ID",
+    all.x = TRUE
+  )
+}
+ ```
+
+ ```{r}
+#------------------------------------------------------------
+# Prepare Model 5 random effects
+#------------------------------------------------------------
+
+make_effect_m5 <- prepare_random_effect(
+  m5$summary.random$make_id,
+  market_data_inla$make_id,
+  market_data_inla$make
+)
+
+model_effect_m5 <- prepare_random_effect(
+  m5$summary.random$model_series_id,
+  market_data_inla$model_series_id,
+  market_data_inla$model_series
+)
+
+country_effect_m5 <- prepare_random_effect(
+  m5$summary.random$country_id,
+  market_data_inla$country_id,
+  market_data_inla$country
+)
+ ```
+
+```{r}
+select_effects_for_plot <- function(effect_data, max_levels = 15) {
+  
+  n_levels <- nrow(effect_data)
+  
+  # If the number of levels is small enough, show all
+  if (n_levels <= max_levels) {
+    
+    effect_data <- effect_data[
+      order(effect_data$mean),
+    ]
+    
+    return(effect_data)
+  }
+  
+  # Otherwise, keep only the most relevant levels
+  effect_data$abs_mean <- abs(effect_data$mean)
+  
+  effect_data <- effect_data[
+    order(effect_data$abs_mean, decreasing = TRUE),
+  ]
+  
+  effect_data <- head(effect_data, max_levels)
+  
+  effect_data <- effect_data[
+    order(effect_data$mean),
+  ]
+  
+  effect_data
+}
+```
+
+ ```{r}
+ plot_random_effects <- function(effect_data, title) {
+  
+  y_positions <- seq_len(nrow(effect_data))
+  
+  plot(
+    effect_data$mean,
+    y_positions,
+    pch = 16,
+    xlim = range(
+      effect_data$`0.025quant`,
+      effect_data$`0.975quant`
+    ),
+    yaxt = "n",
+    ylab = "",
+    xlab = "Effect on log sold price",
+    main = title
+  )
+  
+  segments(
+    x0 = effect_data$`0.025quant`,
+    y0 = y_positions,
+    x1 = effect_data$`0.975quant`,
+    y1 = y_positions
+  )
+  
+  points(
+    effect_data$mean,
+    y_positions,
+    pch = 16
+  )
+  
+  axis(
+    side = 2,
+    at = y_positions,
+    labels = effect_data$Label,
+    las = 2,
+    cex.axis = 0.8
+  )
+  
+  abline(
+    v = 0,
+    lty = 2,
+    col = "red"
+  )
+}
+ ```
+
+```{r}
+country_effect_plot <- select_effects_for_plot(
+  country_effect_m5,
+  max_levels = 15
+)
+
+make_effect_plot <- select_effects_for_plot(
+  make_effect_m5,
+  max_levels = 15
+)
+
+model_effect_plot <- select_effects_for_plot(
+  model_effect_m5,
+  max_levels = 15
+)
+```
+
+```{r}
+ #------------------------------------------------------------
+# Plot all IID random effects
+#------------------------------------------------------------
+old_par <- par(
+  mfrow = c(1, 3),
+  mar = c(5, 8, 4, 2)
+)
+
+plot_random_effects(
+  country_effect_plot,
+  "Country random effects"
+)
+
+plot_random_effects(
+  make_effect_plot,
+  "Make random effects"
+)
+
+plot_random_effects(
+  model_effect_plot,
+  "Model-series random effects"
+)
+
+par(old_par)
+```
+
+```{r}
+#------------------------------------------------------------
+# Model 5: joint posterior sampling
+#------------------------------------------------------------
+
+# Number of training and test observations
+n_train_m5 <- nrow(
+  market_data_sold_train
+)
+
+n_test_m5 <- nrow(
+  market_data_sold_test
+)
+
+
+# Positions of the test observations in market_data_inla
+# Training observations are stored before test observations
+test_rows_m5 <-
+  n_train_m5 + seq_len(n_test_m5)
+
+
+# Number of joint posterior samples
+n_posterior_samples_m5 <- 5000
+
+
+# Set the seed for reproducibility
+set.seed(123)
+
+
+# Draw jointly from the approximate posterior distribution
+# and retain only the test linear predictors
+posterior_samples_m5 <- inla.posterior.sample(
+  n = n_posterior_samples_m5,
+  result = m5,
+
+  selection = list(
+    Predictor = test_rows_m5
+  ),
+
+  # Return hyperparameters on their natural scale
+  intern = FALSE,
+
+  seed = 123L,
+  num.threads = 1
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Extract posterior draws
+#------------------------------------------------------------
+
+# Extract the selected test linear predictors
+# Rows are test observations and columns are posterior samples
+linear_predictor_draws_m5 <- sapply(
+  posterior_samples_m5,
+  function(sample_m5) {
+    as.numeric(
+      sample_m5$latent
+    )
+  }
+)
+
+
+# Extract the residual precision from each posterior sample
+# The residual precision is the first hyperparameter in Model 5
+residual_precision_draws_m5 <- sapply(
+  posterior_samples_m5,
+  function(sample_m5) {
+    as.numeric(
+      sample_m5$hyperpar
+    )[1]
+  }
+)
+
+
+# Use the degrees of freedom fixed when fitting Model 5
+degrees_freedom_m5 <- 7
+```
+
+```{r}
+#------------------------------------------------------------
+# Simulate Student-t observation errors
+#------------------------------------------------------------
+
+# Convert each posterior draw of residual precision
+# into the corresponding Student-t scale
+residual_scale_draws_m5 <- sqrt(
+  (degrees_freedom_m5 - 2) /
+    (
+      degrees_freedom_m5 *
+        residual_precision_draws_m5
+    )
+)
+
+
+# Set the seed for the observation-level simulations
+set.seed(456)
+
+
+# Draw one standard Student-t error for every
+# test observation and posterior sample
+standard_t_errors_m5 <- matrix(
+  rt(
+    n_test_m5 *
+      n_posterior_samples_m5,
+
+    df = degrees_freedom_m5
+  ),
+
+  nrow = n_test_m5,
+  ncol = n_posterior_samples_m5
+)
+
+
+# Apply the residual scale associated with each
+# posterior draw of the precision
+residual_draws_m5 <- sweep(
+  standard_t_errors_m5,
+  MARGIN = 2,
+  STATS = residual_scale_draws_m5,
+  FUN = "*"
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Generate posterior predictive log-prices
+#------------------------------------------------------------
+
+# Add observation-level errors to the jointly sampled
+# linear predictors
+log_price_draws_m5 <-
+  linear_predictor_draws_m5 +
+  residual_draws_m5
+```
+
+```{r}
+#------------------------------------------------------------
+# Calculate posterior predictive intervals
+#------------------------------------------------------------
+
+# Calculate the 2.5%, 50% and 97.5% quantiles
+# for every test observation
+predictive_quantiles_log_m5 <- t(
+  apply(
+    log_price_draws_m5,
+    1,
+    quantile,
+    probs = c(
+      0.025,
+      0.50,
+      0.975
+    ),
+    names = FALSE
+  )
+)
+
+
+# Create the test prediction dataset
+prediction_plot_m5 <- data.frame(
+
+  # Observed sold price
+  observed_price =
+    market_data_sold_test$price_sold,
+
+  # Posterior predictive median
+  predicted_price =
+    exp(
+      predictive_quantiles_log_m5[, 2]
+    ),
+
+  # Lower bound of the 95% posterior predictive interval
+  lower_95 =
+    exp(
+      predictive_quantiles_log_m5[, 1]
+    ),
+
+  # Upper bound of the 95% posterior predictive interval
+  upper_95 =
+    exp(
+      predictive_quantiles_log_m5[, 3]
+    )
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Order test predictions for plotting
+#------------------------------------------------------------
+
+# Order observations by posterior predictive median
+prediction_plot_m5 <- prediction_plot_m5[
+  order(
+    prediction_plot_m5$predicted_price
+  ),
+]
+
+
+# Create an index for the ordered observations
+prediction_plot_m5$Index <- seq_len(
+  nrow(prediction_plot_m5)
+)
+
+
+# Inspect the resulting prediction dataset
+head(prediction_plot_m5)
+```
+
+```{r}
+#------------------------------------------------------------
+# Prediction plot with clipped upper intervals
+#------------------------------------------------------------
+
+# Limit the displayed y-axis so that a few very wide
+# predictive intervals do not compress the entire plot
+plot_limit_m5 <- as.numeric(
+  quantile(
+    prediction_plot_m5$upper_95,
+    probs = 0.99
+  )
+)
+
+# Identify upper intervals that exceed the displayed range
+interval_clipped_m5 <-
+  prediction_plot_m5$upper_95 >
+  plot_limit_m5
+
+
+# Save the current graphical margins
+old_mar <- par("mar")
+
+# Increase the left margin for readable EUR labels
+par(
+  mar = c(5, 7, 4, 2) + 0.1
+)
+
+
+# Create the empty plotting area
+plot(
+  prediction_plot_m5$Index,
+  prediction_plot_m5$predicted_price,
+  type = "n",
+  xlab = "Index",
+  ylab = "",
+  main = "Observed and predicted sold prices in the test set",
+  ylim = c(0, plot_limit_m5),
+  yaxt = "n"
+)
+
+
+# Create readable labels for the price axis
+y_ticks_m5 <- pretty(
+  c(0, plot_limit_m5)
+)
+
+axis(
+  side = 2,
+  at = y_ticks_m5,
+  labels = format(
+    y_ticks_m5,
+    big.mark = ",",
+    scientific = FALSE,
+    trim = TRUE
+  ),
+  las = 1
+)
+
+mtext(
+  "Sold price (EUR)",
+  side = 2,
+  line = 5
+)
+
+
+# Lower bound of the 95% posterior predictive interval
+lines(
+  prediction_plot_m5$Index,
+  prediction_plot_m5$lower_95,
+  lty = 2,
+  lwd = 0.8
+)
+
+
+# Upper bound of the 95% posterior predictive interval
+# Values exceeding the axis limit are clipped
+lines(
+  prediction_plot_m5$Index,
+  pmin(
+    prediction_plot_m5$upper_95,
+    plot_limit_m5
+  ),
+  lty = 2,
+  lwd = 0.8
+)
+
+
+# Posterior predictive median: empty circles
+points(
+  prediction_plot_m5$Index,
+  prediction_plot_m5$predicted_price,
+  pch = 1,
+  cex = 0.45
+)
+
+
+# Observed sold prices: blue plus symbols
+points(
+  prediction_plot_m5$Index,
+  prediction_plot_m5$observed_price,
+  pch = 3,
+  col = "blue",
+  cex = 0.45
+)
+
+
+# Triangles indicate upper intervals extending beyond the axis
+points(
+  prediction_plot_m5$Index[interval_clipped_m5],
+  rep(
+    plot_limit_m5,
+    sum(interval_clipped_m5)
+  ),
+  pch = 17,
+  cex = 0.6
+)
+
+
+# Add the legend
+legend(
+  "topleft",
+  legend = c(
+    "Predicted prices",
+    "Observed prices",
+    "95% posterior predictive intervals",
+    "Interval continues above axis"
+  ),
+  pch = c(1, 3, NA, 17),
+  lty = c(NA, NA, 2, NA),
+  col = c(
+    "black",
+    "blue",
+    "black",
+    "black"
+  ),
+  bty = "n",
+  cex = 0.85
+)
+
+
+# Restore the original graphical margins
+par(
+  mar = old_mar
+)
+```
+
+
+```{r}
+##Check residuals
+#------------------------------------------------------------
+# Residuals versus fitted values for Model 5
+#------------------------------------------------------------
+
+# Observed and fitted values on the model scale
+observed_log_m5 <- log(
+  market_data_sold_train$price_sold
+)
+
+fitted_log_m5 <- evaluation_m5$predicted_train
+
+# Residuals
+residuals_m5 <- observed_log_m5 - fitted_log_m5
+
+# Student-t residual standard deviation
+residual_sd_m5 <- sqrt(
+  1 / precision_residual_m5
+)
+
+# Standardized residuals
+standardized_residuals_m5 <-
+  residuals_m5 / residual_sd_m5
+
+# Plot
+plot(
+  fitted_log_m5,
+  standardized_residuals_m5,
+  pch = 1,
+  cex = 0.5,
+  xlab = "Fitted log sold price",
+  ylab = "Standardized residuals",
+  main = "Residuals vs fitted values"
+)
+
+abline(
+  h = 0,
+  lty = 2
+)
+
+lines(
+  lowess(
+    fitted_log_m5,
+    standardized_residuals_m5
+  ),
+  lwd = 2
+)
+```
+
+```{r}
+#------------------------------------------------------------
+# Observed vs fitted/predicted prices for Model 5
+# Price scale, not log-price scale
+#------------------------------------------------------------
+
+# Training set: observed and fitted prices
+train_plot_m5 <- data.frame(
+  observed = market_data_sold_train$price_sold,
+  fitted = exp(evaluation_m5$predicted_train)
+)
+
+# Test set: observed and predicted prices
+test_plot_m5 <- data.frame(
+  observed = market_data_sold_test$price_sold,
+  predicted = exp(evaluation_m5$predicted_test)
+)
+
+# Common plotting range for both panels
+plot_range_m5 <- range(
+  train_plot_m5$observed,
+  train_plot_m5$fitted,
+  test_plot_m5$observed,
+  test_plot_m5$predicted,
+  finite = TRUE
+)
+
+# Two-panel layout
+old_par <- par(no.readonly = TRUE)
+
+par(
+  mfrow = c(1, 2),
+  mar = c(5, 5, 3, 1)
+)
+
+#------------------------------------------------------------
+# Left panel: training set
+#------------------------------------------------------------
+plot(
+  x = train_plot_m5$observed,
+  y = train_plot_m5$fitted,
+  pch = 1,
+  cex = 0.6,
+  xlab = "Observed sold price in EUR",
+  ylab = "Fitted sold price in EUR",
+  main = "Training set",
+  xlim = plot_range_m5,
+  ylim = plot_range_m5
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2
+)
+
+#------------------------------------------------------------
+# Right panel: test set
+#------------------------------------------------------------
+plot(
+  x = test_plot_m5$observed,
+  y = test_plot_m5$predicted,
+  pch = 1,
+  cex = 0.6,
+  xlab = "Observed sold price in EUR",
+  ylab = "Predicted sold price in EUR",
+  main = "Test set",
+  xlim = plot_range_m5,
+  ylim = plot_range_m5
+)
+
+abline(
+  a = 0,
+  b = 1,
+  lty = 2
+)
+
+# Restore previous graphical settings
+par(old_par)
+```
+
+
+```{r}
+### Run all ###
+```
+summary(m5)
